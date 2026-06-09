@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "Estoque SaaS"
+    APP_NAME: str = "LimaStock"
     APP_ENV: str = "local"
     APP_DEBUG: bool = True
 
@@ -10,14 +10,16 @@ class Settings(BaseSettings):
 
     SUPABASE_URL: str
     SUPABASE_ANON_KEY: str
-    SUPABASE_SERVICE_ROLE_KEY: str | None = None
+    SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_JWT_AUDIENCE: str = "authenticated"
 
     FRONTEND_URL: str = "http://localhost:3000"
 
     ASAAS_BASE_URL: str = "https://api-sandbox.asaas.com/v3"
-    ASAAS_API_KEY: str = "sua_chave_sandbox_asaas"
-    ASAAS_WEBHOOK_TOKEN: str = "troque_esse_token"
+    ASAAS_API_KEY: str
+    ASAAS_WEBHOOK_TOKEN: str
+
+    PLATFORM_ADMIN_EMAILS: str = "d175259@dac.unicamp.br"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -27,3 +29,11 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def get_platform_admin_emails() -> set[str]:
+    return {
+        email.strip().lower()
+        for email in settings.PLATFORM_ADMIN_EMAILS.split(",")
+        if email.strip()
+    }
