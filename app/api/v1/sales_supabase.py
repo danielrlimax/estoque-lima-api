@@ -128,15 +128,23 @@ def create_sale_row(
     )
 
 
-def remove_column_from_items(items: list[dict], column: str) -> list[dict]:
+def remove_column_from_rows(rows: list[dict], column: str) -> list[dict]:
     return [
         {
             key: value
-            for key, value in item.items()
+            for key, value in row.items()
             if key != column
         }
-        for item in items
+        for row in rows
     ]
+
+
+def remove_column_from_payload(payload: dict, column: str) -> dict:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != column
+    }
 
 
 def insert_sale_items(items: list[dict]) -> list[dict]:
@@ -171,7 +179,7 @@ def insert_sale_items(items: list[dict]) -> list[dict]:
 
             for column in removable_columns:
                 if column in error_text:
-                    current_items = remove_column_from_items(current_items, column)
+                    current_items = remove_column_from_rows(current_items, column)
                     removed = True
                     break
 
@@ -199,10 +207,16 @@ def insert_stock_movement(
 ):
     supabase = get_supabase_admin()
 
-    full_payload = {
+    payload = {
         "tenant_id": tenant_id,
         "product_id": product_id,
+
+        # Seu banco antigo exige esta coluna:
+        "type": "out",
+
+        # Código novo usa esta coluna. Se não existir, removemos no fallback.
         "movement_type": "out",
+
         "quantity": str(quantity),
         "previous_stock": str(previous_stock),
         "new_stock": str(new_stock),
@@ -210,20 +224,47 @@ def insert_stock_movement(
         "created_by": created_by,
     }
 
-    try:
-        supabase.table("stock_movements").insert(full_payload).execute()
-        return
+    removable_columns = [
+        "movement_type",
+        "previous_stock",
+        "new_stock",
+        "reason",
+        "created_by",
+    ]
 
-    except Exception:
-        minimal_payload = {
-            "tenant_id": tenant_id,
-            "product_id": product_id,
-            "movement_type": "out",
-            "quantity": str(quantity),
-            "reason": f"Venda {sale_id}",
-        }
+    current_payload = payload
+    last_error = None
 
-        supabase.table("stock_movements").insert(minimal_payload).execute()
+    for _ in range(8):
+        try:
+            supabase.table("stock_movements").insert(current_payload).execute()
+            return
+
+        except Exception as error:
+            last_error = error
+            error_text = str(error)
+
+            removed = False
+
+            for column in removable_columns:
+                if column in error_text:
+                    current_payload = remove_column_from_payload(
+                        current_payload,
+                        column,
+                    )
+                    removed = True
+                    break
+
+            if not removed:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=error_text,
+                )
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=str(last_error),
+    )
 
 
 @router.post("")
@@ -309,12 +350,7 @@ def create_sale(
                 "product_barcode": product_barcode,
                 "quantity": str(quantity),
                 "unit_price": str(unit_price),
-
-                # O seu banco exige esta coluna:
                 "total": str(item_total),
-
-                # Alguns schemas usam esta coluna. Se não existir,
-                # insert_sale_items remove automaticamente.
                 "total_price": str(item_total),
             })
 
