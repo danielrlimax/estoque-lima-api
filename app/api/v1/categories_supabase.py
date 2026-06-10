@@ -4,7 +4,11 @@ from pydantic import BaseModel, Field
 from app.core.audit import write_audit_log
 from app.core.security import get_current_user
 from app.core.subscription_guard import ensure_tenant_access_is_active
-from app.db.supabase_client import get_supabase_admin, get_supabase_with_token
+from app.core.tenant_security import (
+    ensure_safe_tenant_access,
+    ensure_safe_tenant_management,
+)
+from app.db.supabase_client import get_supabase_admin
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
 
@@ -27,10 +31,11 @@ def list_categories(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
         response = (
             supabase
@@ -58,10 +63,11 @@ def create_category(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_management(current_user, payload.tenant_id)
     ensure_tenant_access_is_active(payload.tenant_id)
 
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
         response = (
             supabase
@@ -79,16 +85,12 @@ def create_category(
         category = response.data[0]
 
         write_audit_log(
+            tenant_id=payload.tenant_id,
             action="category.create",
             entity_type="category",
-            tenant_id=payload.tenant_id,
-            entity_id=category["id"],
+            entity_id=category.get("id"),
             description=f"Categoria criada: {category.get('name')}",
-            metadata={
-                "name": category.get("name"),
-                "description": category.get("description"),
-                "active": category.get("active"),
-            },
+            metadata={"category": category},
             current_user=current_user,
             request=request,
         )
@@ -112,10 +114,10 @@ def update_category(
     current_user: dict = Depends(get_current_user),
 ):
     try:
-        supabase_admin = get_supabase_admin()
+        supabase = get_supabase_admin()
 
-        category_response = (
-            supabase_admin
+        old_response = (
+            supabase
             .table("categories")
             .select("*")
             .eq("id", category_id)
@@ -123,20 +125,19 @@ def update_category(
             .execute()
         )
 
-        if not category_response.data:
+        if not old_response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Categoria não encontrada.",
             )
 
-        old_category = category_response.data[0]
+        old_category = old_response.data[0]
         tenant_id = old_category["tenant_id"]
 
+        ensure_safe_tenant_management(current_user, tenant_id)
         ensure_tenant_access_is_active(tenant_id)
 
         update_data = payload.model_dump(exclude_unset=True)
-
-        supabase = get_supabase_with_token(current_user["access_token"])
 
         response = (
             supabase
@@ -155,9 +156,9 @@ def update_category(
         category = response.data[0]
 
         write_audit_log(
+            tenant_id=tenant_id,
             action="category.update",
             entity_type="category",
-            tenant_id=tenant_id,
             entity_id=category_id,
             description=f"Categoria atualizada: {category.get('name')}",
             metadata={

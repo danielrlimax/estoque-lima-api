@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -6,7 +7,11 @@ from pydantic import BaseModel, Field
 from app.core.audit import write_audit_log
 from app.core.security import get_current_user
 from app.core.subscription_guard import ensure_tenant_access_is_active
-from app.db.supabase_client import get_supabase_admin, get_supabase_with_token
+from app.core.tenant_security import (
+    ensure_safe_tenant_access,
+    ensure_safe_tenant_management,
+)
+from app.db.supabase_client import get_supabase_admin
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
@@ -14,21 +19,20 @@ router = APIRouter(prefix="/products", tags=["Products"])
 class ProductCreateRequest(BaseModel):
     tenant_id: str
     category_id: str | None = None
-    name: str = Field(min_length=2, max_length=160)
+    name: str = Field(min_length=2, max_length=180)
     description: str | None = None
     barcode: str | None = None
     unit: str = "unit"
-    cost_price: Decimal = Field(ge=0)
-    sale_price: Decimal = Field(ge=0)
-    current_stock: Decimal = Field(default=0, ge=0)
-    min_stock: Decimal = Field(default=0, ge=0)
+    cost_price: Decimal = Field(default=Decimal("0"), ge=0)
+    sale_price: Decimal = Field(default=Decimal("0"), ge=0)
+    current_stock: Decimal = Field(default=Decimal("0"), ge=0)
+    min_stock: Decimal = Field(default=Decimal("0"), ge=0)
     active: bool = True
 
 
 class ProductUpdateRequest(BaseModel):
-    tenant_id: str | None = None
     category_id: str | None = None
-    name: str | None = Field(default=None, min_length=2, max_length=160)
+    name: str | None = Field(default=None, min_length=2, max_length=180)
     description: str | None = None
     barcode: str | None = None
     unit: str | None = None
@@ -39,19 +43,16 @@ class ProductUpdateRequest(BaseModel):
     active: bool | None = None
 
 
-def decimal_to_str(value):
-    if isinstance(value, Decimal):
-        return str(value)
+def normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = {}
 
-    return value
+    for key, value in data.items():
+        if isinstance(value, Decimal):
+            normalized[key] = str(value)
+        else:
+            normalized[key] = value
 
-
-def serialize_payload(payload: dict):
-    return {
-        key: decimal_to_str(value)
-        for key, value in payload.items()
-        if value is not None
-    }
+    return normalized
 
 
 @router.get("")
@@ -59,10 +60,11 @@ def list_products(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
         response = (
             supabase
@@ -90,10 +92,11 @@ def get_product_by_barcode(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
         response = (
             supabase
@@ -129,12 +132,30 @@ def create_product(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_management(current_user, payload.tenant_id)
     ensure_tenant_access_is_active(payload.tenant_id)
 
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
-        data = serialize_payload(payload.model_dump())
+        if payload.barcode:
+            existing = (
+                supabase
+                .table("products")
+                .select("id")
+                .eq("tenant_id", payload.tenant_id)
+                .eq("barcode", payload.barcode)
+                .limit(1)
+                .execute()
+            )
+
+            if existing.data:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Já existe um produto com este código de barras.",
+                )
+
+        data = normalize_payload(payload.model_dump())
 
         response = (
             supabase
@@ -152,17 +173,12 @@ def create_product(
         product = response.data[0]
 
         write_audit_log(
+            tenant_id=payload.tenant_id,
             action="product.create",
             entity_type="product",
-            tenant_id=payload.tenant_id,
-            entity_id=product["id"],
+            entity_id=product.get("id"),
             description=f"Produto criado: {product.get('name')}",
-            metadata={
-                "name": product.get("name"),
-                "barcode": product.get("barcode"),
-                "sale_price": product.get("sale_price"),
-                "current_stock": product.get("current_stock"),
-            },
+            metadata={"product": product},
             current_user=current_user,
             request=request,
         )
@@ -186,10 +202,10 @@ def update_product(
     current_user: dict = Depends(get_current_user),
 ):
     try:
-        supabase_admin = get_supabase_admin()
+        supabase = get_supabase_admin()
 
-        product_response = (
-            supabase_admin
+        old_response = (
+            supabase
             .table("products")
             .select("*")
             .eq("id", product_id)
@@ -197,23 +213,37 @@ def update_product(
             .execute()
         )
 
-        if not product_response.data:
+        if not old_response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Produto não encontrado.",
             )
 
-        old_product = product_response.data[0]
+        old_product = old_response.data[0]
         tenant_id = old_product["tenant_id"]
 
+        ensure_safe_tenant_management(current_user, tenant_id)
         ensure_tenant_access_is_active(tenant_id)
 
-        supabase = get_supabase_with_token(current_user["access_token"])
+        update_data = normalize_payload(payload.model_dump(exclude_unset=True))
 
-        update_data = serialize_payload(payload.model_dump(exclude_unset=True))
+        if "barcode" in update_data and update_data["barcode"]:
+            existing = (
+                supabase
+                .table("products")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .eq("barcode", update_data["barcode"])
+                .neq("id", product_id)
+                .limit(1)
+                .execute()
+            )
 
-        if "tenant_id" in update_data:
-            update_data.pop("tenant_id")
+            if existing.data:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Já existe outro produto com este código de barras.",
+                )
 
         response = (
             supabase
@@ -232,9 +262,9 @@ def update_product(
         product = response.data[0]
 
         write_audit_log(
+            tenant_id=tenant_id,
             action="product.update",
             entity_type="product",
-            tenant_id=tenant_id,
             entity_id=product_id,
             description=f"Produto atualizado: {product.get('name')}",
             metadata={

@@ -1,19 +1,28 @@
-from datetime import datetime, timezone
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.security import get_current_user
 from app.core.subscription_guard import ensure_tenant_access_is_active
+from app.core.tenant_security import ensure_safe_tenant_access
 from app.db.supabase_client import get_supabase_admin
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
+def to_decimal(value) -> Decimal:
+    try:
+        return Decimal(str(value or 0))
+    except Exception:
+        return Decimal("0")
+
+
 @router.get("/summary")
-def get_dashboard_summary(
+def dashboard_summary(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
     try:
@@ -22,7 +31,7 @@ def get_dashboard_summary(
         products_response = (
             supabase
             .table("products")
-            .select("id, active, current_stock, min_stock")
+            .select("id,current_stock,min_stock,active")
             .eq("tenant_id", tenant_id)
             .execute()
         )
@@ -30,7 +39,7 @@ def get_dashboard_summary(
         sales_response = (
             supabase
             .table("sales")
-            .select("id, total, created_at")
+            .select("id,total,status,created_at")
             .eq("tenant_id", tenant_id)
             .execute()
         )
@@ -38,43 +47,35 @@ def get_dashboard_summary(
         products = products_response.data or []
         sales = sales_response.data or []
 
-        today = datetime.now(timezone.utc).date()
-        current_month = datetime.now(timezone.utc).month
-        current_year = datetime.now(timezone.utc).year
-
-        sales_today = []
-        revenue_today = 0
-        revenue_month = 0
-
-        for sale in sales:
-            created_at = datetime.fromisoformat(
-                sale["created_at"].replace("Z", "+00:00")
-            )
-
-            total = float(sale["total"] or 0)
-
-            if created_at.date() == today:
-                sales_today.append(sale)
-                revenue_today += total
-
-            if created_at.month == current_month and created_at.year == current_year:
-                revenue_month += total
+        active_products = [
+            product
+            for product in products
+            if product.get("active") is True
+        ]
 
         low_stock_products = [
             product
-            for product in products
-            if product["active"]
-            and float(product["current_stock"]) <= float(product["min_stock"])
+            for product in active_products
+            if to_decimal(product.get("current_stock")) <= to_decimal(product.get("min_stock"))
         ]
+
+        completed_sales = [
+            sale
+            for sale in sales
+            if sale.get("status") == "completed"
+        ]
+
+        total_revenue = sum(
+            to_decimal(sale.get("total"))
+            for sale in completed_sales
+        )
 
         return {
             "total_products": len(products),
-            "active_products": len([product for product in products if product["active"]]),
+            "active_products": len(active_products),
             "low_stock_products": len(low_stock_products),
-            "total_sales": len(sales),
-            "sales_today": len(sales_today),
-            "revenue_today": str(revenue_today),
-            "revenue_month": str(revenue_month),
+            "total_sales": len(completed_sales),
+            "total_revenue": str(total_revenue),
         }
 
     except HTTPException:
@@ -87,10 +88,11 @@ def get_dashboard_summary(
 
 
 @router.get("/low-stock")
-def get_low_stock_products(
+def dashboard_low_stock(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
     try:
@@ -99,7 +101,7 @@ def get_low_stock_products(
         response = (
             supabase
             .table("products")
-            .select("id, name, barcode, current_stock, min_stock, sale_price")
+            .select("*")
             .eq("tenant_id", tenant_id)
             .eq("active", True)
             .execute()
@@ -110,10 +112,10 @@ def get_low_stock_products(
         low_stock = [
             product
             for product in products
-            if float(product["current_stock"]) <= float(product["min_stock"])
+            if to_decimal(product.get("current_stock")) <= to_decimal(product.get("min_stock"))
         ]
 
-        return low_stock
+        return low_stock[:10]
 
     except HTTPException:
         raise
@@ -125,10 +127,11 @@ def get_low_stock_products(
 
 
 @router.get("/recent-sales")
-def get_recent_sales(
+def dashboard_recent_sales(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
     try:
@@ -140,7 +143,7 @@ def get_recent_sales(
             .select("*")
             .eq("tenant_id", tenant_id)
             .order("created_at", desc=True)
-            .limit(10)
+            .limit(8)
             .execute()
         )
 
