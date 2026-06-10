@@ -1,105 +1,114 @@
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.core.plan_limits import get_plan_usage
 from app.core.security import get_current_user
-from app.db.supabase_client import get_supabase_with_token
-from app.schemas.subscription import SubscriptionStatusResponse
+from app.core.tenant_security import ensure_safe_tenant_access
+from app.db.supabase_client import get_supabase_admin
 
 router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 
 
-def parse_datetime(value: str | None):
-    if not value:
-        return None
+ACTIVE_SUBSCRIPTION_STATUSES = {"active", "trialing"}
 
+
+def get_latest_subscription(tenant_id: str) -> dict | None:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-@router.get("/status", response_model=SubscriptionStatusResponse)
-def get_subscription_status(
-    tenant_id: str = Query(...),
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        supabase = get_supabase_with_token(current_user["access_token"])
-
-        member_response = (
-            supabase
-            .table("tenant_members")
-            .select("id")
-            .eq("tenant_id", tenant_id)
-            .eq("user_id", current_user["id"])
-            .eq("active", True)
-            .limit(1)
-            .execute()
-        )
-
-        if not member_response.data:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Você não pertence a este tenant.",
-            )
+        supabase = get_supabase_admin()
 
         response = (
             supabase
             .table("subscriptions")
-            .select(
-                "tenant_id, status, trial_ends_at, current_period_end, "
-                "asaas_customer_id, asaas_subscription_id, "
-                "plans(code, name)"
-            )
+            .select("*")
             .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
 
         if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Assinatura não encontrada.",
-            )
+            return None
 
-        subscription = response.data[0]
+        return response.data[0]
 
-        status_value = subscription["status"]
-        now = datetime.now(timezone.utc)
-
-        trial_ends_at = parse_datetime(subscription.get("trial_ends_at"))
-        current_period_end = parse_datetime(subscription.get("current_period_end"))
-
-        is_active = False
-
-        if status_value == "active":
-            is_active = True
-
-        elif status_value == "trialing":
-            limit_date = trial_ends_at or current_period_end
-
-            if limit_date and limit_date >= now:
-                is_active = True
-
-        plan = subscription.get("plans") or {}
-
-        return {
-            "tenant_id": subscription["tenant_id"],
-            "status": status_value,
-            "is_active": is_active,
-            "plan_code": plan.get("code"),
-            "plan_name": plan.get("name"),
-            "trial_ends_at": subscription.get("trial_ends_at"),
-            "current_period_end": subscription.get("current_period_end"),
-            "asaas_customer_id": subscription.get("asaas_customer_id"),
-            "asaas_subscription_id": subscription.get("asaas_subscription_id"),
-        }
-
-    except HTTPException:
-        raise
-    except Exception as error:
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
+            detail="Erro ao consultar assinatura.",
         )
+
+
+def get_plan_by_id(plan_id: str | None) -> dict | None:
+    if not plan_id:
+        return None
+
+    try:
+        supabase = get_supabase_admin()
+
+        response = (
+            supabase
+            .table("plans")
+            .select("*")
+            .eq("id", plan_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+            return None
+
+        return response.data[0]
+
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erro ao consultar plano.",
+        )
+
+
+@router.get("/status")
+def get_subscription_status(
+    tenant_id: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_safe_tenant_access(current_user, tenant_id)
+
+    subscription = get_latest_subscription(tenant_id)
+
+    if not subscription:
+        return {
+            "tenant_id": tenant_id,
+            "status": "none",
+            "is_active": False,
+            "plan_code": None,
+            "plan_name": None,
+            "trial_ends_at": None,
+            "current_period_end": None,
+            "asaas_customer_id": None,
+            "asaas_subscription_id": None,
+        }
+
+    plan = get_plan_by_id(subscription.get("plan_id"))
+
+    subscription_status = subscription.get("status") or "none"
+
+    return {
+        "tenant_id": tenant_id,
+        "status": subscription_status,
+        "is_active": subscription_status in ACTIVE_SUBSCRIPTION_STATUSES,
+        "plan_code": plan.get("code") if plan else None,
+        "plan_name": plan.get("name") if plan else None,
+        "trial_ends_at": subscription.get("trial_ends_at"),
+        "current_period_end": subscription.get("current_period_end"),
+        "asaas_customer_id": subscription.get("asaas_customer_id"),
+        "asaas_subscription_id": subscription.get("asaas_subscription_id"),
+    }
+
+
+@router.get("/usage")
+def get_subscription_usage(
+    tenant_id: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_safe_tenant_access(current_user, tenant_id)
+
+    return get_plan_usage(tenant_id)
