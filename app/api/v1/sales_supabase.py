@@ -85,9 +85,6 @@ def create_sale_row(
         "created_by": created_by,
     }
 
-    # Status principal da nossa regra de negócio.
-    # Se o enum do banco ainda não tiver "completed", rode:
-    # alter type public.sale_status add value if not exists 'completed';
     try:
         response = (
             supabase
@@ -108,7 +105,6 @@ def create_sale_row(
         if "sale_status" not in error_text and "status" not in error_text:
             raise
 
-    # Fallback para bancos com default em sales.status.
     try:
         response = (
             supabase
@@ -130,6 +126,121 @@ def create_sale_row(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="Não foi possível criar venda.",
     )
+
+
+def insert_sale_items(items: list[dict]) -> list[dict]:
+    supabase = get_supabase_admin()
+
+    try:
+        response = (
+            supabase
+            .table("sale_items")
+            .insert(items)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as first_error:
+        first_error_text = str(first_error)
+
+        if "total_price" not in first_error_text:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=first_error_text,
+            )
+
+    items_without_total_price = [
+        {
+            key: value
+            for key, value in item.items()
+            if key != "total_price"
+        }
+        for item in items
+    ]
+
+    try:
+        response = (
+            supabase
+            .table("sale_items")
+            .insert(items_without_total_price)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as second_error:
+        second_error_text = str(second_error)
+
+        if "tenant_id" not in second_error_text:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=second_error_text,
+            )
+
+    minimal_items = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"tenant_id", "total_price"}
+        }
+        for item in items
+    ]
+
+    try:
+        response = (
+            supabase
+            .table("sale_items")
+            .insert(minimal_items)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as third_error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(third_error),
+        )
+
+
+def insert_stock_movement(
+    *,
+    tenant_id: str,
+    product_id: str,
+    quantity: Decimal,
+    previous_stock: Decimal,
+    new_stock: Decimal,
+    sale_id: str,
+    created_by: str | None,
+):
+    supabase = get_supabase_admin()
+
+    full_payload = {
+        "tenant_id": tenant_id,
+        "product_id": product_id,
+        "movement_type": "out",
+        "quantity": str(quantity),
+        "previous_stock": str(previous_stock),
+        "new_stock": str(new_stock),
+        "reason": f"Venda {sale_id}",
+        "created_by": created_by,
+    }
+
+    try:
+        supabase.table("stock_movements").insert(full_payload).execute()
+        return
+
+    except Exception:
+        minimal_payload = {
+            "tenant_id": tenant_id,
+            "product_id": product_id,
+            "movement_type": "out",
+            "quantity": str(quantity),
+            "reason": f"Venda {sale_id}",
+        }
+
+        supabase.table("stock_movements").insert(minimal_payload).execute()
 
 
 @router.post("")
@@ -259,28 +370,22 @@ def create_sale(
             for item in sale_items_to_insert
         ]
 
-        items_response = (
-            supabase
-            .table("sale_items")
-            .insert(items_with_sale_id)
-            .execute()
-        )
+        inserted_items = insert_sale_items(items_with_sale_id)
 
         for update in product_updates:
             supabase.table("products").update({
                 "current_stock": str(update["new_stock"]),
             }).eq("id", update["product_id"]).execute()
 
-            supabase.table("stock_movements").insert({
-                "tenant_id": payload.tenant_id,
-                "product_id": update["product_id"],
-                "movement_type": "out",
-                "quantity": str(update["quantity"]),
-                "previous_stock": str(update["old_stock"]),
-                "new_stock": str(update["new_stock"]),
-                "reason": f"Venda {sale_id}",
-                "created_by": current_user.get("id"),
-            }).execute()
+            insert_stock_movement(
+                tenant_id=payload.tenant_id,
+                product_id=update["product_id"],
+                quantity=update["quantity"],
+                previous_stock=update["old_stock"],
+                new_stock=update["new_stock"],
+                sale_id=sale_id,
+                created_by=current_user.get("id"),
+            )
 
         write_audit_log(
             tenant_id=payload.tenant_id,
@@ -307,7 +412,7 @@ def create_sale(
 
         return {
             "sale": sale,
-            "items": items_response.data or [],
+            "items": inserted_items,
         }
 
     except HTTPException:
