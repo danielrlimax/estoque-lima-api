@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from app.core.config import settings
+from app.core.csrf import clear_csrf_cookie, set_csrf_cookie
 from app.core.security import get_current_user
 from app.db.supabase_client import get_supabase
 from app.schemas.auth import LoginRequest
@@ -75,8 +76,15 @@ def login(payload: LoginRequest, response: Response):
             refresh_token=auth_response.session.refresh_token,
         )
 
+        csrf_token = set_csrf_cookie(
+            response=response,
+            secure=settings.COOKIE_SECURE,
+            samesite=settings.COOKIE_SAMESITE,
+        )
+
         return {
             "authenticated": True,
+            "csrf_token": csrf_token,
             "user": {
                 "id": auth_response.user.id,
                 "email": auth_response.user.email,
@@ -119,8 +127,15 @@ def refresh_session(request: Request, response: Response):
             refresh_token=auth_response.session.refresh_token,
         )
 
+        csrf_token = set_csrf_cookie(
+            response=response,
+            secure=settings.COOKIE_SECURE,
+            samesite=settings.COOKIE_SAMESITE,
+        )
+
         return {
             "refreshed": True,
+            "csrf_token": csrf_token,
             "user": {
                 "id": auth_response.user.id if auth_response.user else None,
                 "email": auth_response.user.email if auth_response.user else None,
@@ -131,6 +146,11 @@ def refresh_session(request: Request, response: Response):
         raise
     except Exception:
         clear_auth_cookies(response)
+        clear_csrf_cookie(
+            response=response,
+            secure=settings.COOKIE_SECURE,
+            samesite=settings.COOKIE_SAMESITE,
+        )
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -141,6 +161,11 @@ def refresh_session(request: Request, response: Response):
 @router.post("/logout")
 def logout(response: Response):
     clear_auth_cookies(response)
+    clear_csrf_cookie(
+        response=response,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+    )
 
     return {
         "logged_out": True,
