@@ -152,7 +152,7 @@ def insert_sale_items(items: list[dict]) -> list[dict]:
 
     last_error = None
 
-    for _ in range(5):
+    for _ in range(8):
         try:
             response = (
                 supabase
@@ -298,9 +298,9 @@ def create_sale(
             product_name = str(product.get("name") or "Produto")
             product_barcode = product.get("barcode")
             unit_price = Decimal(str(product.get("sale_price") or 0))
-            total_price = unit_price * quantity
+            item_total = unit_price * quantity
 
-            subtotal += total_price
+            subtotal += item_total
 
             sale_items_to_insert.append({
                 "tenant_id": payload.tenant_id,
@@ -309,7 +309,13 @@ def create_sale(
                 "product_barcode": product_barcode,
                 "quantity": str(quantity),
                 "unit_price": str(unit_price),
-                "total_price": str(total_price),
+
+                # O seu banco exige esta coluna:
+                "total": str(item_total),
+
+                # Alguns schemas usam esta coluna. Se não existir,
+                # insert_sale_items remove automaticamente.
+                "total_price": str(item_total),
             })
 
             product_updates.append({
@@ -328,7 +334,7 @@ def create_sale(
                 detail="Desconto não pode ser maior que o subtotal.",
             )
 
-        total = subtotal - discount
+        sale_total = subtotal - discount
 
         customer_name = (
             payload.customer_name.strip()
@@ -342,7 +348,7 @@ def create_sale(
             payment_method=payload.payment_method,
             subtotal=subtotal,
             discount=discount,
-            total=total,
+            total=sale_total,
             notes=payload.notes,
             created_by=current_user.get("id"),
         )
@@ -379,7 +385,7 @@ def create_sale(
             action="sale.create",
             entity_type="sale",
             entity_id=sale_id,
-            description=f"Venda finalizada: {str(total)}",
+            description=f"Venda finalizada: {str(sale_total)}",
             metadata={
                 "sale": sale,
                 "items": items_with_sale_id,
