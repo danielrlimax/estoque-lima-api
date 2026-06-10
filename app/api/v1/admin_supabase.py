@@ -1,4 +1,7 @@
+from datetime import datetime, timedelta, timezone
 from typing import Any
+import re
+import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -14,8 +17,11 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 
 class TenantCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=160)
-    slug: str = Field(min_length=2, max_length=120)
-    status: str = "trialing"
+    slug: str | None = Field(default=None, max_length=120)
+    email: str | None = None
+    phone: str | None = None
+    document: str | None = None
+    status: str = Field(default="trialing", pattern="^(active|trialing|suspended|canceled|cancelled|banned)$")
     owner_email: str | None = None
 
 
@@ -50,6 +56,59 @@ class CouponUpdateRequest(BaseModel):
     active: bool | None = None
 
 
+def clean_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+
+    return cleaned or None
+
+
+def normalize_email(value: str | None) -> str | None:
+    cleaned = clean_text(value)
+
+    if not cleaned:
+        return None
+
+    return cleaned.lower()
+
+
+def slugify(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_text = ascii_text.lower()
+    ascii_text = re.sub(r"[^a-z0-9]+", "-", ascii_text)
+    ascii_text = re.sub(r"-+", "-", ascii_text)
+    ascii_text = ascii_text.strip("-")
+
+    return ascii_text or "estabelecimento"
+
+
+def get_unique_slug(base_slug: str) -> str:
+    supabase = get_supabase_admin()
+
+    base = slugify(base_slug)
+    slug = base
+    counter = 2
+
+    while True:
+        response = (
+            supabase
+            .table("tenants")
+            .select("id")
+            .eq("slug", slug)
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+            return slug
+
+        slug = f"{base}-{counter}"
+        counter += 1
+
+
 def get_profile_by_email(email: str) -> dict | None:
     supabase = get_supabase_admin()
 
@@ -66,6 +125,200 @@ def get_profile_by_email(email: str) -> dict | None:
         return None
 
     return response.data[0]
+
+
+def get_default_plan() -> dict:
+    supabase = get_supabase_admin()
+
+    response = (
+        supabase
+        .table("plans")
+        .select("*")
+        .eq("code", "starter")
+        .limit(1)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+
+    fallback_response = (
+        supabase
+        .table("plans")
+        .select("*")
+        .eq("active", True)
+        .order("price_monthly", desc=False)
+        .limit(1)
+        .execute()
+    )
+
+    if fallback_response.data:
+        return fallback_response.data[0]
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Nenhum plano ativo encontrado. Crie um plano antes de criar estabelecimentos.",
+    )
+
+
+def create_trial_subscription(tenant_id: str, plan_id: str) -> dict | None:
+    supabase = get_supabase_admin()
+
+    now = datetime.now(timezone.utc)
+    trial_ends_at = now + timedelta(days=14)
+    current_period_end = now + timedelta(days=30)
+
+    full_payload = {
+        "tenant_id": tenant_id,
+        "plan_id": plan_id,
+        "provider": "manual",
+        "status": "trialing",
+        "trial_ends_at": trial_ends_at.isoformat(),
+        "current_period_end": current_period_end.isoformat(),
+        "metadata": {
+            "created_by": "platform_admin",
+            "source": "admin_panel",
+            "trial_days": 14,
+        },
+    }
+
+    try:
+        response = (
+            supabase
+            .table("subscriptions")
+            .insert(full_payload)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception:
+        pass
+
+    minimal_payload = {
+        "tenant_id": tenant_id,
+        "plan_id": plan_id,
+        "status": "trialing",
+    }
+
+    response = (
+        supabase
+        .table("subscriptions")
+        .insert(minimal_payload)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+
+    return None
+
+
+def insert_tenant(payload: TenantCreateRequest, slug: str) -> dict:
+    supabase = get_supabase_admin()
+
+    full_payload = {
+        "name": payload.name.strip(),
+        "slug": slug,
+        "email": normalize_email(payload.email),
+        "phone": clean_text(payload.phone),
+        "document": clean_text(payload.document),
+        "status": payload.status,
+    }
+
+    full_payload = {
+        key: value
+        for key, value in full_payload.items()
+        if value is not None
+    }
+
+    try:
+        response = (
+            supabase
+            .table("tenants")
+            .insert(full_payload)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception:
+        minimal_payload = {
+            "name": payload.name.strip(),
+            "slug": slug,
+            "status": payload.status,
+        }
+
+        response = (
+            supabase
+            .table("tenants")
+            .insert(minimal_payload)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Não foi possível criar estabelecimento.",
+    )
+
+
+def add_owner_member(tenant_id: str, owner_user_id: str) -> dict | None:
+    supabase = get_supabase_admin()
+
+    existing_response = (
+        supabase
+        .table("tenant_members")
+        .select("id")
+        .eq("tenant_id", tenant_id)
+        .eq("user_id", owner_user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if existing_response.data:
+        return existing_response.data[0]
+
+    full_payload = {
+        "tenant_id": tenant_id,
+        "user_id": owner_user_id,
+        "role": "owner",
+        "active": True,
+    }
+
+    try:
+        response = (
+            supabase
+            .table("tenant_members")
+            .insert(full_payload)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception:
+        minimal_payload = {
+            "tenant_id": tenant_id,
+            "user_id": owner_user_id,
+            "role": "owner",
+        }
+
+        response = (
+            supabase
+            .table("tenant_members")
+            .insert(minimal_payload)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    return None
 
 
 def normalize_coupon_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -209,75 +462,82 @@ def create_tenant(
     require_platform_admin(current_user)
 
     try:
-        supabase = get_supabase_admin()
-
-        existing = (
-            supabase
-            .table("tenants")
-            .select("id")
-            .eq("slug", payload.slug)
-            .limit(1)
-            .execute()
-        )
-
-        if existing.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Já existe um estabelecimento com este slug.",
-            )
-
-        tenant_response = (
-            supabase
-            .table("tenants")
-            .insert({
-                "name": payload.name,
-                "slug": payload.slug,
-                "status": payload.status,
-            })
-            .execute()
-        )
-
-        if not tenant_response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar estabelecimento.",
-            )
-
-        tenant = tenant_response.data[0]
-
+        owner_email = normalize_email(payload.owner_email)
         owner_profile = None
+        owner_user_id = current_user.get("id")
 
-        if payload.owner_email:
-            owner_profile = get_profile_by_email(payload.owner_email)
+        if owner_email:
+            owner_profile = get_profile_by_email(owner_email)
 
             if not owner_profile:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Usuário dono não encontrado. Ele precisa criar conta antes.",
+                    detail=(
+                        "Usuário dono não encontrado. "
+                        "Ele precisa criar conta e fazer login pelo menos uma vez antes."
+                    ),
                 )
 
-            supabase.table("tenant_members").insert({
-                "tenant_id": tenant["id"],
-                "user_id": owner_profile["id"],
-                "role": "owner",
-            }).execute()
+            owner_user_id = owner_profile.get("id")
+
+        if not owner_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível identificar o dono do estabelecimento.",
+            )
+
+        slug_base = payload.slug or payload.name
+        slug = get_unique_slug(slug_base)
+
+        plan = get_default_plan()
+
+        tenant = insert_tenant(payload, slug)
+
+        owner_member = add_owner_member(
+            tenant_id=tenant["id"],
+            owner_user_id=str(owner_user_id),
+        )
+
+        subscription = create_trial_subscription(
+            tenant_id=tenant["id"],
+            plan_id=plan["id"],
+        )
+
+        if not subscription:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Estabelecimento criado, mas não foi possível criar assinatura trial.",
+            )
 
         write_audit_log(
+            tenant_id=tenant.get("id"),
             action="tenant.create",
             entity_type="tenant",
             entity_id=tenant.get("id"),
             description=f"Estabelecimento criado: {tenant.get('name')}",
             metadata={
                 "tenant": tenant,
-                "owner_email": payload.owner_email,
+                "owner_email": owner_email or current_user.get("email"),
+                "owner_member": owner_member,
+                "subscription": subscription,
+                "plan": {
+                    "id": plan.get("id"),
+                    "code": plan.get("code"),
+                    "name": plan.get("name"),
+                },
             },
             current_user=current_user,
             request=request,
         )
 
         return {
-            "tenant": tenant,
-            "owner": owner_profile,
+            **tenant,
+            "owner": owner_profile or {
+                "id": current_user.get("id"),
+                "email": current_user.get("email"),
+            },
+            "subscription": subscription,
+            "plan": plan,
         }
 
     except HTTPException:
@@ -412,16 +672,29 @@ def add_tenant_member(
                 detail="Este usuário já faz parte do estabelecimento.",
             )
 
-        response = (
-            supabase
-            .table("tenant_members")
-            .insert({
-                "tenant_id": tenant_id,
-                "user_id": profile["id"],
-                "role": payload.role,
-            })
-            .execute()
-        )
+        try:
+            response = (
+                supabase
+                .table("tenant_members")
+                .insert({
+                    "tenant_id": tenant_id,
+                    "user_id": profile["id"],
+                    "role": payload.role,
+                    "active": True,
+                })
+                .execute()
+            )
+        except Exception:
+            response = (
+                supabase
+                .table("tenant_members")
+                .insert({
+                    "tenant_id": tenant_id,
+                    "user_id": profile["id"],
+                    "role": payload.role,
+                })
+                .execute()
+            )
 
         if not response.data:
             raise HTTPException(
