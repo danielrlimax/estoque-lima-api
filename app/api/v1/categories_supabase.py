@@ -26,6 +26,13 @@ class CategoryUpdateRequest(BaseModel):
     active: bool | None = None
 
 
+def dump_model(model: BaseModel, exclude_unset: bool = False) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_unset=exclude_unset)
+
+    return model.dict(exclude_unset=exclude_unset)
+
+
 def remove_column(payload: dict, column: str) -> dict:
     return {
         key: value
@@ -34,34 +41,130 @@ def remove_column(payload: dict, column: str) -> dict:
     }
 
 
+def normalize_category_row(row: dict) -> dict:
+    if "active" not in row and "is_active" in row:
+        row["active"] = row.get("is_active")
+
+    if "description" not in row:
+        row["description"] = None
+
+    return row
+
+
+def build_category_insert_attempts(payload: dict) -> list[dict]:
+    attempts: list[dict] = []
+
+    base_payload = {
+        "tenant_id": payload.get("tenant_id"),
+        "name": payload.get("name"),
+        "description": payload.get("description"),
+        "active": payload.get("active", True),
+    }
+
+    attempts.append(base_payload)
+
+    attempts.append({
+        "tenant_id": payload.get("tenant_id"),
+        "name": payload.get("name"),
+        "description": payload.get("description"),
+        "is_active": payload.get("active", True),
+    })
+
+    attempts.append({
+        "tenant_id": payload.get("tenant_id"),
+        "name": payload.get("name"),
+        "active": payload.get("active", True),
+    })
+
+    attempts.append({
+        "tenant_id": payload.get("tenant_id"),
+        "name": payload.get("name"),
+        "is_active": payload.get("active", True),
+    })
+
+    attempts.append({
+        "tenant_id": payload.get("tenant_id"),
+        "name": payload.get("name"),
+    })
+
+    unique_attempts: list[dict] = []
+
+    for attempt in attempts:
+        clean_attempt = {
+            key: value
+            for key, value in attempt.items()
+            if value is not None
+        }
+
+        if clean_attempt not in unique_attempts:
+            unique_attempts.append(clean_attempt)
+
+    return unique_attempts
+
+
+def build_category_update_attempts(payload: dict) -> list[dict]:
+    attempts: list[dict] = []
+
+    base_payload = {}
+
+    if "name" in payload:
+        base_payload["name"] = payload["name"]
+
+    if "description" in payload:
+        base_payload["description"] = payload["description"]
+
+    if "active" in payload:
+        base_payload["active"] = payload["active"]
+
+    attempts.append(base_payload)
+
+    if "active" in payload:
+        is_active_payload = remove_column(base_payload, "active")
+        is_active_payload["is_active"] = payload["active"]
+        attempts.append(is_active_payload)
+
+    attempts.append(remove_column(base_payload, "description"))
+
+    if "active" in payload:
+        minimal_is_active = remove_column(
+            remove_column(base_payload, "description"),
+            "active",
+        )
+        minimal_is_active["is_active"] = payload["active"]
+        attempts.append(minimal_is_active)
+
+    unique_attempts: list[dict] = []
+
+    for attempt in attempts:
+        clean_attempt = {
+            key: value
+            for key, value in attempt.items()
+            if value is not None
+        }
+
+        if clean_attempt and clean_attempt not in unique_attempts:
+            unique_attempts.append(clean_attempt)
+
+    return unique_attempts
+
+
 def insert_category_with_fallback(payload: dict) -> dict:
     supabase = get_supabase_admin()
 
-    attempts: list[dict] = []
-
-    attempts.append(payload)
-
-    if "active" in payload:
-        attempts.append({
-            **remove_column(payload, "active"),
-            "is_active": payload["active"],
-        })
-
-    attempts.append(remove_column(payload, "active"))
-
+    attempts = build_category_insert_attempts(payload)
     last_error = None
 
-    for current_payload in attempts:
+    for attempt in attempts:
         try:
             response = (
                 supabase
                 .table("categories")
-                .insert(current_payload)
+                .insert(attempt)
                 .execute()
             )
 
             if response.data:
-                return response.data[0]
+                return normalize_category_row(response.data[0])
 
         except Exception as error:
             last_error = error
@@ -75,35 +178,21 @@ def insert_category_with_fallback(payload: dict) -> dict:
 def update_category_with_fallback(category_id: str, payload: dict) -> dict:
     supabase = get_supabase_admin()
 
-    attempts: list[dict] = []
-
-    attempts.append(payload)
-
-    if "active" in payload:
-        attempts.append({
-            **remove_column(payload, "active"),
-            "is_active": payload["active"],
-        })
-
-    attempts.append(remove_column(payload, "active"))
-
+    attempts = build_category_update_attempts(payload)
     last_error = None
 
-    for current_payload in attempts:
-        if not current_payload:
-            continue
-
+    for attempt in attempts:
         try:
             response = (
                 supabase
                 .table("categories")
-                .update(current_payload)
+                .update(attempt)
                 .eq("id", category_id)
                 .execute()
             )
 
             if response.data:
-                return response.data[0]
+                return normalize_category_row(response.data[0])
 
         except Exception as error:
             last_error = error
@@ -114,15 +203,22 @@ def update_category_with_fallback(category_id: str, payload: dict) -> dict:
     )
 
 
+def safe_write_audit_log(**kwargs):
+    try:
+        write_audit_log(**kwargs)
+    except Exception:
+        return None
+
+
 @router.get("")
 def list_categories(
     tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
-    ensure_safe_tenant_access(current_user, tenant_id)
-    ensure_tenant_access_is_active(tenant_id)
-
     try:
+        ensure_safe_tenant_access(current_user, tenant_id)
+        ensure_tenant_access_is_active(tenant_id)
+
         supabase = get_supabase_admin()
 
         response = (
@@ -134,14 +230,16 @@ def list_categories(
             .execute()
         )
 
-        return response.data or []
+        categories = response.data or []
+
+        return [normalize_category_row(category) for category in categories]
 
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
+            detail=f"Erro interno ao listar categorias: {str(error)}",
         )
 
 
@@ -151,15 +249,14 @@ def create_category(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    ensure_safe_tenant_management(current_user, payload.tenant_id)
-    ensure_tenant_access_is_active(payload.tenant_id)
-
     try:
-        category_payload = payload.model_dump()
+        ensure_safe_tenant_management(current_user, payload.tenant_id)
+        ensure_tenant_access_is_active(payload.tenant_id)
 
+        category_payload = dump_model(payload)
         category = insert_category_with_fallback(category_payload)
 
-        write_audit_log(
+        safe_write_audit_log(
             tenant_id=payload.tenant_id,
             action="category.create",
             entity_type="category",
@@ -206,17 +303,16 @@ def update_category(
                 detail="Categoria não encontrada.",
             )
 
-        old_category = old_response.data[0]
+        old_category = normalize_category_row(old_response.data[0])
         tenant_id = old_category["tenant_id"]
 
         ensure_safe_tenant_management(current_user, tenant_id)
         ensure_tenant_access_is_active(tenant_id)
 
-        update_data = payload.model_dump(exclude_unset=True)
-
+        update_data = dump_model(payload, exclude_unset=True)
         category = update_category_with_fallback(category_id, update_data)
 
-        write_audit_log(
+        safe_write_audit_log(
             tenant_id=tenant_id,
             action="category.update",
             entity_type="category",
