@@ -17,6 +17,7 @@ from app.api.v1.dashboard_supabase import router as dashboard_router
 from app.api.v1.admin_supabase import router as admin_router
 from app.api.v1.audit_supabase import router as audit_router
 from app.api.v1.admin_plans_supabase import router as admin_plans_router
+from app.api.v1.admin_finance_supabase import router as admin_finance_router
 
 api_router = APIRouter()
 
@@ -35,6 +36,7 @@ api_router.include_router(dashboard_router)
 api_router.include_router(admin_router)
 api_router.include_router(audit_router)
 api_router.include_router(admin_plans_router)
+api_router.include_router(admin_finance_router)
 
 if settings.APP_ENV == "local":
     from app.api.v1.supabase_test import router as supabase_test_router
