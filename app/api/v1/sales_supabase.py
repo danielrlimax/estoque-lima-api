@@ -128,80 +128,63 @@ def create_sale_row(
     )
 
 
+def remove_column_from_items(items: list[dict], column: str) -> list[dict]:
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if key != column
+        }
+        for item in items
+    ]
+
+
 def insert_sale_items(items: list[dict]) -> list[dict]:
     supabase = get_supabase_admin()
 
-    try:
-        response = (
-            supabase
-            .table("sale_items")
-            .insert(items)
-            .execute()
-        )
+    current_items = items
 
-        return response.data or []
-
-    except Exception as first_error:
-        first_error_text = str(first_error)
-
-        if "total_price" not in first_error_text:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=first_error_text,
-            )
-
-    items_without_total_price = [
-        {
-            key: value
-            for key, value in item.items()
-            if key != "total_price"
-        }
-        for item in items
+    removable_columns = [
+        "total_price",
+        "product_barcode",
+        "tenant_id",
     ]
 
-    try:
-        response = (
-            supabase
-            .table("sale_items")
-            .insert(items_without_total_price)
-            .execute()
-        )
+    last_error = None
 
-        return response.data or []
-
-    except Exception as second_error:
-        second_error_text = str(second_error)
-
-        if "tenant_id" not in second_error_text:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=second_error_text,
+    for _ in range(5):
+        try:
+            response = (
+                supabase
+                .table("sale_items")
+                .insert(current_items)
+                .execute()
             )
 
-    minimal_items = [
-        {
-            key: value
-            for key, value in item.items()
-            if key not in {"tenant_id", "total_price"}
-        }
-        for item in items
-    ]
+            return response.data or []
 
-    try:
-        response = (
-            supabase
-            .table("sale_items")
-            .insert(minimal_items)
-            .execute()
-        )
+        except Exception as error:
+            last_error = error
+            error_text = str(error)
 
-        return response.data or []
+            removed = False
 
-    except Exception as third_error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(third_error),
-        )
+            for column in removable_columns:
+                if column in error_text:
+                    current_items = remove_column_from_items(current_items, column)
+                    removed = True
+                    break
+
+            if not removed:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=error_text,
+                )
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=str(last_error),
+    )
 
 
 def insert_stock_movement(
@@ -312,6 +295,8 @@ def create_sale(
                     detail=f"Estoque insuficiente para {product.get('name')}.",
                 )
 
+            product_name = str(product.get("name") or "Produto")
+            product_barcode = product.get("barcode")
             unit_price = Decimal(str(product.get("sale_price") or 0))
             total_price = unit_price * quantity
 
@@ -320,6 +305,8 @@ def create_sale(
             sale_items_to_insert.append({
                 "tenant_id": payload.tenant_id,
                 "product_id": item.product_id,
+                "product_name": product_name,
+                "product_barcode": product_barcode,
                 "quantity": str(quantity),
                 "unit_price": str(unit_price),
                 "total_price": str(total_price),
@@ -330,7 +317,7 @@ def create_sale(
                 "old_stock": current_stock,
                 "new_stock": current_stock - quantity,
                 "quantity": quantity,
-                "product_name": product.get("name"),
+                "product_name": product_name,
             })
 
         discount = Decimal(str(payload.discount or 0))
