@@ -3,15 +3,32 @@ from fastapi import HTTPException, status
 from app.db.supabase_client import get_supabase_admin
 
 
-ACTIVE_SUBSCRIPTION_STATUSES = [
+ACTIVE_SUBSCRIPTION_STATUSES = {
     "active",
     "trialing",
-    "paid",
     "manual",
-]
+}
+
+
+def is_subscription_active(subscription: dict | None) -> bool:
+    if not subscription:
+        return False
+
+    subscription_status = subscription.get("status")
+
+    return subscription_status in ACTIVE_SUBSCRIPTION_STATUSES
 
 
 def get_tenant_current_subscription(tenant_id: str) -> dict | None:
+    """
+    Busca a assinatura mais recente do estabelecimento sem usar .in_ no campo status.
+
+    Motivo:
+    - O campo subscriptions.status provavelmente é um enum no Supabase/PostgreSQL.
+    - Se consultarmos com um valor que não existe no enum, como "paid", o banco retorna:
+      invalid input value for enum subscription_status.
+    - Por isso, buscamos as últimas assinaturas e validamos o status no Python.
+    """
     try:
         supabase = get_supabase_admin()
 
@@ -20,16 +37,21 @@ def get_tenant_current_subscription(tenant_id: str) -> dict | None:
             .table("subscriptions")
             .select("*")
             .eq("tenant_id", tenant_id)
-            .in_("status", ACTIVE_SUBSCRIPTION_STATUSES)
             .order("created_at", desc=True)
-            .limit(1)
+            .limit(10)
             .execute()
         )
 
-        if not response.data:
+        subscriptions = response.data or []
+
+        if not subscriptions:
             return None
 
-        return response.data[0]
+        for subscription in subscriptions:
+            if is_subscription_active(subscription):
+                return subscription
+
+        return None
 
     except Exception as error:
         raise HTTPException(
