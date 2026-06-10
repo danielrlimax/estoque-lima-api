@@ -1,9 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.core.audit import write_audit_log
 from app.core.security import get_current_user
-from app.core.subscription_guard import ensure_tenant_access_is_active
 from app.core.tenant_security import (
     ensure_safe_tenant_access,
     ensure_safe_tenant_management,
@@ -17,7 +15,6 @@ class CategoryCreateRequest(BaseModel):
     tenant_id: str
     name: str = Field(min_length=2, max_length=120)
     description: str | None = None
-    active: bool = True
 
 
 class CategoryUpdateRequest(BaseModel):
@@ -26,66 +23,59 @@ class CategoryUpdateRequest(BaseModel):
     active: bool | None = None
 
 
-def dump_model(model: BaseModel, exclude_unset: bool = False) -> dict:
+def model_to_dict(model: BaseModel, exclude_unset: bool = False) -> dict:
     if hasattr(model, "model_dump"):
         return model.model_dump(exclude_unset=exclude_unset)
 
     return model.dict(exclude_unset=exclude_unset)
 
 
-def remove_column(payload: dict, column: str) -> dict:
-    return {
-        key: value
-        for key, value in payload.items()
-        if key != column
-    }
+def normalize_category(category: dict) -> dict:
+    if "active" not in category and "is_active" in category:
+        category["active"] = category.get("is_active")
+
+    if "active" not in category:
+        category["active"] = True
+
+    if "description" not in category:
+        category["description"] = None
+
+    return category
 
 
-def normalize_category_row(row: dict) -> dict:
-    if "active" not in row and "is_active" in row:
-        row["active"] = row.get("is_active")
+def create_category_attempts(payload: dict) -> list[dict]:
+    tenant_id = payload["tenant_id"]
+    name = payload["name"].strip()
+    description = payload.get("description")
 
-    if "description" not in row:
-        row["description"] = None
-
-    return row
-
-
-def build_category_insert_attempts(payload: dict) -> list[dict]:
-    attempts: list[dict] = []
-
-    base_payload = {
-        "tenant_id": payload.get("tenant_id"),
-        "name": payload.get("name"),
-        "description": payload.get("description"),
-        "active": payload.get("active", True),
-    }
-
-    attempts.append(base_payload)
-
-    attempts.append({
-        "tenant_id": payload.get("tenant_id"),
-        "name": payload.get("name"),
-        "description": payload.get("description"),
-        "is_active": payload.get("active", True),
-    })
-
-    attempts.append({
-        "tenant_id": payload.get("tenant_id"),
-        "name": payload.get("name"),
-        "active": payload.get("active", True),
-    })
-
-    attempts.append({
-        "tenant_id": payload.get("tenant_id"),
-        "name": payload.get("name"),
-        "is_active": payload.get("active", True),
-    })
-
-    attempts.append({
-        "tenant_id": payload.get("tenant_id"),
-        "name": payload.get("name"),
-    })
+    attempts = [
+        {
+            "tenant_id": tenant_id,
+            "name": name,
+            "description": description,
+            "active": True,
+        },
+        {
+            "tenant_id": tenant_id,
+            "name": name,
+            "description": description,
+            "is_active": True,
+        },
+        {
+            "tenant_id": tenant_id,
+            "name": name,
+            "active": True,
+        },
+        {
+            "tenant_id": tenant_id,
+            "name": name,
+            "is_active": True,
+        },
+        {
+            "tenant_id": tenant_id,
+            "name": name,
+        },
+    ]
 
     unique_attempts: list[dict] = []
 
@@ -102,36 +92,37 @@ def build_category_insert_attempts(payload: dict) -> list[dict]:
     return unique_attempts
 
 
-def build_category_update_attempts(payload: dict) -> list[dict]:
+def update_category_attempts(payload: dict) -> list[dict]:
     attempts: list[dict] = []
 
-    base_payload = {}
+    base: dict = {}
 
-    if "name" in payload:
-        base_payload["name"] = payload["name"]
+    if "name" in payload and payload["name"] is not None:
+        base["name"] = payload["name"].strip()
 
     if "description" in payload:
-        base_payload["description"] = payload["description"]
+        base["description"] = payload["description"]
 
-    if "active" in payload:
-        base_payload["active"] = payload["active"]
+    if "active" in payload and payload["active"] is not None:
+        base["active"] = payload["active"]
 
-    attempts.append(base_payload)
+    attempts.append(base)
 
-    if "active" in payload:
-        is_active_payload = remove_column(base_payload, "active")
-        is_active_payload["is_active"] = payload["active"]
+    if "active" in base:
+        is_active_payload = {
+            key: value
+            for key, value in base.items()
+            if key != "active"
+        }
+        is_active_payload["is_active"] = base["active"]
         attempts.append(is_active_payload)
 
-    attempts.append(remove_column(base_payload, "description"))
-
-    if "active" in payload:
-        minimal_is_active = remove_column(
-            remove_column(base_payload, "description"),
-            "active",
-        )
-        minimal_is_active["is_active"] = payload["active"]
-        attempts.append(minimal_is_active)
+    no_description = {
+        key: value
+        for key, value in base.items()
+        if key != "description"
+    }
+    attempts.append(no_description)
 
     unique_attempts: list[dict] = []
 
@@ -148,68 +139,6 @@ def build_category_update_attempts(payload: dict) -> list[dict]:
     return unique_attempts
 
 
-def insert_category_with_fallback(payload: dict) -> dict:
-    supabase = get_supabase_admin()
-
-    attempts = build_category_insert_attempts(payload)
-    last_error = None
-
-    for attempt in attempts:
-        try:
-            response = (
-                supabase
-                .table("categories")
-                .insert(attempt)
-                .execute()
-            )
-
-            if response.data:
-                return normalize_category_row(response.data[0])
-
-        except Exception as error:
-            last_error = error
-
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"Não foi possível criar categoria: {str(last_error)}",
-    )
-
-
-def update_category_with_fallback(category_id: str, payload: dict) -> dict:
-    supabase = get_supabase_admin()
-
-    attempts = build_category_update_attempts(payload)
-    last_error = None
-
-    for attempt in attempts:
-        try:
-            response = (
-                supabase
-                .table("categories")
-                .update(attempt)
-                .eq("id", category_id)
-                .execute()
-            )
-
-            if response.data:
-                return normalize_category_row(response.data[0])
-
-        except Exception as error:
-            last_error = error
-
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"Não foi possível atualizar categoria: {str(last_error)}",
-    )
-
-
-def safe_write_audit_log(**kwargs):
-    try:
-        write_audit_log(**kwargs)
-    except Exception:
-        return None
-
-
 @router.get("")
 def list_categories(
     tenant_id: str = Query(...),
@@ -217,7 +146,6 @@ def list_categories(
 ):
     try:
         ensure_safe_tenant_access(current_user, tenant_id)
-        ensure_tenant_access_is_active(tenant_id)
 
         supabase = get_supabase_admin()
 
@@ -230,51 +158,59 @@ def list_categories(
             .execute()
         )
 
-        categories = response.data or []
-
-        return [normalize_category_row(category) for category in categories]
+        return [
+            normalize_category(category)
+            for category in (response.data or [])
+        ]
 
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro interno ao listar categorias: {str(error)}",
+            detail=f"Erro ao listar categorias: {str(error)}",
         )
 
 
 @router.post("")
 def create_category(
     payload: CategoryCreateRequest,
-    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     try:
         ensure_safe_tenant_management(current_user, payload.tenant_id)
-        ensure_tenant_access_is_active(payload.tenant_id)
 
-        category_payload = dump_model(payload)
-        category = insert_category_with_fallback(category_payload)
+        supabase = get_supabase_admin()
+        data = model_to_dict(payload)
 
-        safe_write_audit_log(
-            tenant_id=payload.tenant_id,
-            action="category.create",
-            entity_type="category",
-            entity_id=category.get("id"),
-            description=f"Categoria criada: {category.get('name')}",
-            metadata={"category": category},
-            current_user=current_user,
-            request=request,
+        last_error = None
+
+        for attempt in create_category_attempts(data):
+            try:
+                response = (
+                    supabase
+                    .table("categories")
+                    .insert(attempt)
+                    .execute()
+                )
+
+                if response.data:
+                    return normalize_category(response.data[0])
+
+            except Exception as error:
+                last_error = error
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Não foi possível criar categoria: {str(last_error)}",
         )
-
-        return category
 
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro interno ao criar categoria: {str(error)}",
+            detail=f"Erro ao criar categoria: {str(error)}",
         )
 
 
@@ -282,7 +218,6 @@ def create_category(
 def update_category(
     category_id: str,
     payload: CategoryUpdateRequest,
-    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     try:
@@ -303,36 +238,39 @@ def update_category(
                 detail="Categoria não encontrada.",
             )
 
-        old_category = normalize_category_row(old_response.data[0])
+        old_category = normalize_category(old_response.data[0])
         tenant_id = old_category["tenant_id"]
 
         ensure_safe_tenant_management(current_user, tenant_id)
-        ensure_tenant_access_is_active(tenant_id)
 
-        update_data = dump_model(payload, exclude_unset=True)
-        category = update_category_with_fallback(category_id, update_data)
+        data = model_to_dict(payload, exclude_unset=True)
+        last_error = None
 
-        safe_write_audit_log(
-            tenant_id=tenant_id,
-            action="category.update",
-            entity_type="category",
-            entity_id=category_id,
-            description=f"Categoria atualizada: {category.get('name')}",
-            metadata={
-                "before": old_category,
-                "changes": update_data,
-                "after": category,
-            },
-            current_user=current_user,
-            request=request,
+        for attempt in update_category_attempts(data):
+            try:
+                response = (
+                    supabase
+                    .table("categories")
+                    .update(attempt)
+                    .eq("id", category_id)
+                    .execute()
+                )
+
+                if response.data:
+                    return normalize_category(response.data[0])
+
+            except Exception as error:
+                last_error = error
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Não foi possível atualizar categoria: {str(last_error)}",
         )
-
-        return category
 
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro interno ao atualizar categoria: {str(error)}",
+            detail=f"Erro ao atualizar categoria: {str(error)}",
         )

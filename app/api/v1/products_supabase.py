@@ -44,11 +44,31 @@ class ProductUpdateRequest(BaseModel):
     active: bool | None = None
 
 
+
+def normalize_barcode(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = "".join(str(value).strip().split())
+
+    if not normalized:
+        return None
+
+    allowed_chars = []
+
+    for char in normalized:
+        if char.isalnum() or char in "-_.":
+            allowed_chars.append(char)
+
+    return "".join(allowed_chars) or None
+
 def normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
     normalized = {}
 
     for key, value in data.items():
-        if isinstance(value, Decimal):
+        if key == "barcode":
+            normalized[key] = normalize_barcode(value)
+        elif isinstance(value, Decimal):
             normalized[key] = str(value)
         elif value == "":
             normalized[key] = None
@@ -186,38 +206,50 @@ def get_product_by_barcode(
     ensure_safe_tenant_access(current_user, tenant_id)
     ensure_tenant_access_is_active(tenant_id)
 
+    clean_barcode = normalize_barcode(barcode)
+
+    if not clean_barcode:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Código de barras inválido.",
+        )
+
     try:
         supabase = get_supabase_admin()
 
-        try:
-            response = (
-                supabase
-                .table("products")
-                .select("*")
-                .eq("tenant_id", tenant_id)
-                .eq("barcode", barcode)
-                .eq("active", True)
-                .limit(1)
-                .execute()
-            )
-        except Exception:
-            response = (
-                supabase
-                .table("products")
-                .select("*")
-                .eq("tenant_id", tenant_id)
-                .eq("barcode", barcode)
-                .limit(1)
-                .execute()
-            )
+        attempts = [
+            {"active_column": "active", "active_value": True},
+            {"active_column": "is_active", "active_value": True},
+            None,
+        ]
 
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Produto não encontrado.",
-            )
+        response = None
 
-        return response.data[0]
+        for attempt in attempts:
+            try:
+                query = (
+                    supabase
+                    .table("products")
+                    .select("*")
+                    .eq("tenant_id", tenant_id)
+                    .eq("barcode", clean_barcode)
+                    .limit(1)
+                )
+
+                if attempt:
+                    query = query.eq(attempt["active_column"], attempt["active_value"])
+
+                response = query.execute()
+
+                if response.data:
+                    return response.data[0]
+            except Exception:
+                continue
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Produto não encontrado.",
+        )
 
     except HTTPException:
         raise
@@ -241,13 +273,15 @@ def create_product(
     try:
         supabase = get_supabase_admin()
 
-        if payload.barcode:
+        clean_barcode = normalize_barcode(payload.barcode)
+
+        if clean_barcode:
             existing = (
                 supabase
                 .table("products")
                 .select("id")
                 .eq("tenant_id", payload.tenant_id)
-                .eq("barcode", payload.barcode)
+                .eq("barcode", clean_barcode)
                 .limit(1)
                 .execute()
             )
