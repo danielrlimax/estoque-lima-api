@@ -21,12 +21,17 @@ class TenantCreateRequest(BaseModel):
     email: str | None = None
     phone: str | None = None
     document: str | None = None
-    status: str = Field(default="trialing", pattern="^(active|trialing|suspended|canceled|cancelled|banned)$")
+    status: str = Field(
+        default="trialing",
+        pattern="^(active|trialing|suspended|canceled|cancelled|banned)$",
+    )
     owner_email: str | None = None
 
 
 class TenantStatusUpdateRequest(BaseModel):
-    status: str = Field(pattern="^(active|trialing|suspended|canceled|cancelled|banned)$")
+    status: str = Field(
+        pattern="^(active|trialing|suspended|canceled|cancelled|banned)$"
+    )
 
 
 class AddTenantMemberRequest(BaseModel):
@@ -35,7 +40,9 @@ class AddTenantMemberRequest(BaseModel):
 
 
 class SubscriptionStatusUpdateRequest(BaseModel):
-    status: str = Field(pattern="^(active|trialing|past_due|overdue|canceled|cancelled|suspended)$")
+    status: str = Field(
+        pattern="^(active|trialing|past_due|overdue|canceled|cancelled|suspended)$"
+    )
 
 
 class CouponCreateRequest(BaseModel):
@@ -161,60 +168,6 @@ def get_default_plan() -> dict:
     )
 
 
-def create_trial_subscription(tenant_id: str, plan_id: str) -> dict | None:
-    supabase = get_supabase_admin()
-
-    now = datetime.now(timezone.utc)
-    trial_ends_at = now + timedelta(days=14)
-    current_period_end = now + timedelta(days=30)
-
-    full_payload = {
-        "tenant_id": tenant_id,
-        "plan_id": plan_id,
-        "provider": "manual",
-        "status": "trialing",
-        "trial_ends_at": trial_ends_at.isoformat(),
-        "current_period_end": current_period_end.isoformat(),
-        "metadata": {
-            "created_by": "platform_admin",
-            "source": "admin_panel",
-            "trial_days": 14,
-        },
-    }
-
-    try:
-        response = (
-            supabase
-            .table("subscriptions")
-            .insert(full_payload)
-            .execute()
-        )
-
-        if response.data:
-            return response.data[0]
-
-    except Exception:
-        pass
-
-    minimal_payload = {
-        "tenant_id": tenant_id,
-        "plan_id": plan_id,
-        "status": "trialing",
-    }
-
-    response = (
-        supabase
-        .table("subscriptions")
-        .insert(minimal_payload)
-        .execute()
-    )
-
-    if response.data:
-        return response.data[0]
-
-    return None
-
-
 def insert_tenant(payload: TenantCreateRequest, slug: str) -> dict:
     supabase = get_supabase_admin()
 
@@ -283,18 +236,16 @@ def add_owner_member(tenant_id: str, owner_user_id: str) -> dict | None:
     if existing_response.data:
         return existing_response.data[0]
 
-    full_payload = {
-        "tenant_id": tenant_id,
-        "user_id": owner_user_id,
-        "role": "owner",
-        "active": True,
-    }
-
     try:
         response = (
             supabase
             .table("tenant_members")
-            .insert(full_payload)
+            .insert({
+                "tenant_id": tenant_id,
+                "user_id": owner_user_id,
+                "role": "owner",
+                "active": True,
+            })
             .execute()
         )
 
@@ -302,16 +253,62 @@ def add_owner_member(tenant_id: str, owner_user_id: str) -> dict | None:
             return response.data[0]
 
     except Exception:
-        minimal_payload = {
-            "tenant_id": tenant_id,
-            "user_id": owner_user_id,
-            "role": "owner",
-        }
-
         response = (
             supabase
             .table("tenant_members")
-            .insert(minimal_payload)
+            .insert({
+                "tenant_id": tenant_id,
+                "user_id": owner_user_id,
+                "role": "owner",
+            })
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    return None
+
+
+def create_trial_subscription(tenant_id: str, plan_id: str) -> dict | None:
+    supabase = get_supabase_admin()
+
+    now = datetime.now(timezone.utc)
+    trial_ends_at = now + timedelta(days=14)
+    current_period_end = now + timedelta(days=30)
+
+    try:
+        response = (
+            supabase
+            .table("subscriptions")
+            .insert({
+                "tenant_id": tenant_id,
+                "plan_id": plan_id,
+                "provider": "manual",
+                "status": "trialing",
+                "trial_ends_at": trial_ends_at.isoformat(),
+                "current_period_end": current_period_end.isoformat(),
+                "metadata": {
+                    "created_by": "platform_admin",
+                    "source": "admin_panel",
+                    "trial_days": 14,
+                },
+            })
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception:
+        response = (
+            supabase
+            .table("subscriptions")
+            .insert({
+                "tenant_id": tenant_id,
+                "plan_id": plan_id,
+                "status": "trialing",
+            })
             .execute()
         )
 
@@ -407,8 +404,14 @@ def admin_summary(current_user: dict = Depends(get_current_user)):
             "total_subscriptions": len(subscriptions),
             "active_subscriptions": count_status(subscriptions, {"active"}),
             "trialing_subscriptions": count_status(subscriptions, {"trialing"}),
-            "past_due_subscriptions": count_status(subscriptions, {"past_due", "overdue"}),
-            "canceled_subscriptions": count_status(subscriptions, {"canceled", "cancelled"}),
+            "past_due_subscriptions": count_status(
+                subscriptions,
+                {"past_due", "overdue"},
+            ),
+            "canceled_subscriptions": count_status(
+                subscriptions,
+                {"canceled", "cancelled"},
+            ),
 
             "total_coupons": len(coupons),
             "active_coupons": len([
@@ -486,9 +489,7 @@ def create_tenant(
                 detail="Não foi possível identificar o dono do estabelecimento.",
             )
 
-        slug_base = payload.slug or payload.name
-        slug = get_unique_slug(slug_base)
-
+        slug = get_unique_slug(payload.slug or payload.name)
         plan = get_default_plan()
 
         tenant = insert_tenant(payload, slug)
@@ -497,6 +498,12 @@ def create_tenant(
             tenant_id=tenant["id"],
             owner_user_id=str(owner_user_id),
         )
+
+        if not owner_member:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Estabelecimento criado, mas não foi possível vincular o dono.",
+            )
 
         subscription = create_trial_subscription(
             tenant_id=tenant["id"],
