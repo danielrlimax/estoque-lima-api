@@ -44,6 +44,52 @@ class ProductUpdateRequest(BaseModel):
     active: bool | None = None
 
 
+PRODUCT_UNIT_ALIASES = {
+    "un": "unit",
+    "und": "unit",
+    "unid": "unit",
+    "unidade": "unit",
+    "unit": "unit",
+    "units": "unit",
+    "kg": "kg",
+    "quilo": "kg",
+    "quilos": "kg",
+    "kilogram": "kg",
+    "kilograms": "kg",
+    "g": "g",
+    "grama": "g",
+    "gramas": "g",
+    "l": "l",
+    "lt": "l",
+    "litro": "l",
+    "litros": "l",
+    "ml": "ml",
+    "mililitro": "ml",
+    "mililitros": "ml",
+    "cx": "box",
+    "caixa": "box",
+    "caixas": "box",
+    "box": "box",
+    "pct": "pack",
+    "pacote": "pack",
+    "pacotes": "pack",
+    "pack": "pack",
+}
+
+
+def normalize_product_unit(value: str | None) -> str:
+    if value is None:
+        return "unit"
+
+    normalized = str(value).strip().lower()
+
+    if not normalized:
+        return "unit"
+
+    normalized = normalized.replace(" ", "_")
+
+    return PRODUCT_UNIT_ALIASES.get(normalized, "unit")
+
 
 def normalize_barcode(value: str | None) -> str | None:
     if value is None:
@@ -62,12 +108,15 @@ def normalize_barcode(value: str | None) -> str | None:
 
     return "".join(allowed_chars) or None
 
+
 def normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
     normalized = {}
 
     for key, value in data.items():
         if key == "barcode":
             normalized[key] = normalize_barcode(value)
+        elif key == "unit":
+            normalized[key] = normalize_product_unit(value)
         elif isinstance(value, Decimal):
             normalized[key] = str(value)
         elif value == "":
