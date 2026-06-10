@@ -3,6 +3,14 @@ from fastapi import HTTPException, status
 from app.db.supabase_client import get_supabase_admin
 
 
+ACTIVE_SUBSCRIPTION_STATUSES = [
+    "active",
+    "trialing",
+    "paid",
+    "manual",
+]
+
+
 def get_tenant_current_subscription(tenant_id: str) -> dict | None:
     try:
         supabase = get_supabase_admin()
@@ -12,7 +20,7 @@ def get_tenant_current_subscription(tenant_id: str) -> dict | None:
             .table("subscriptions")
             .select("*")
             .eq("tenant_id", tenant_id)
-            .in_("status", ["active", "trialing"])
+            .in_("status", ACTIVE_SUBSCRIPTION_STATUSES)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
@@ -23,10 +31,10 @@ def get_tenant_current_subscription(tenant_id: str) -> dict | None:
 
         return response.data[0]
 
-    except Exception:
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao consultar assinatura do estabelecimento.",
+            detail=f"Erro ao consultar assinatura do estabelecimento: {str(error)}",
         )
 
 
@@ -48,10 +56,10 @@ def get_plan(plan_id: str) -> dict | None:
 
         return response.data[0]
 
-    except Exception:
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao consultar plano.",
+            detail=f"Erro ao consultar plano: {str(error)}",
         )
 
 
@@ -108,21 +116,33 @@ def get_active_products_count(tenant_id: str) -> int:
     try:
         supabase = get_supabase_admin()
 
-        response = (
-            supabase
-            .table("products")
-            .select("id")
-            .eq("tenant_id", tenant_id)
-            .eq("active", True)
-            .execute()
-        )
+        try:
+            response = (
+                supabase
+                .table("products")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .eq("active", True)
+                .execute()
+            )
 
-        return len(response.data or [])
+            return len(response.data or [])
 
-    except Exception:
+        except Exception:
+            response = (
+                supabase
+                .table("products")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+
+            return len(response.data or [])
+
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao contar produtos do estabelecimento.",
+            detail=f"Erro ao contar produtos do estabelecimento: {str(error)}",
         )
 
 
@@ -130,20 +150,33 @@ def get_tenant_members_count(tenant_id: str) -> int:
     try:
         supabase = get_supabase_admin()
 
-        response = (
-            supabase
-            .table("tenant_members")
-            .select("id")
-            .eq("tenant_id", tenant_id)
-            .execute()
-        )
+        try:
+            response = (
+                supabase
+                .table("tenant_members")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .eq("active", True)
+                .execute()
+            )
 
-        return len(response.data or [])
+            return len(response.data or [])
 
-    except Exception:
+        except Exception:
+            response = (
+                supabase
+                .table("tenant_members")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+
+            return len(response.data or [])
+
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao contar usuários do estabelecimento.",
+            detail=f"Erro ao contar usuários do estabelecimento: {str(error)}",
         )
 
 

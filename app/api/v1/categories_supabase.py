@@ -26,6 +26,94 @@ class CategoryUpdateRequest(BaseModel):
     active: bool | None = None
 
 
+def remove_column(payload: dict, column: str) -> dict:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != column
+    }
+
+
+def insert_category_with_fallback(payload: dict) -> dict:
+    supabase = get_supabase_admin()
+
+    attempts: list[dict] = []
+
+    attempts.append(payload)
+
+    if "active" in payload:
+        attempts.append({
+            **remove_column(payload, "active"),
+            "is_active": payload["active"],
+        })
+
+    attempts.append(remove_column(payload, "active"))
+
+    last_error = None
+
+    for current_payload in attempts:
+        try:
+            response = (
+                supabase
+                .table("categories")
+                .insert(current_payload)
+                .execute()
+            )
+
+            if response.data:
+                return response.data[0]
+
+        except Exception as error:
+            last_error = error
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Não foi possível criar categoria: {str(last_error)}",
+    )
+
+
+def update_category_with_fallback(category_id: str, payload: dict) -> dict:
+    supabase = get_supabase_admin()
+
+    attempts: list[dict] = []
+
+    attempts.append(payload)
+
+    if "active" in payload:
+        attempts.append({
+            **remove_column(payload, "active"),
+            "is_active": payload["active"],
+        })
+
+    attempts.append(remove_column(payload, "active"))
+
+    last_error = None
+
+    for current_payload in attempts:
+        if not current_payload:
+            continue
+
+        try:
+            response = (
+                supabase
+                .table("categories")
+                .update(current_payload)
+                .eq("id", category_id)
+                .execute()
+            )
+
+            if response.data:
+                return response.data[0]
+
+        except Exception as error:
+            last_error = error
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Não foi possível atualizar categoria: {str(last_error)}",
+    )
+
+
 @router.get("")
 def list_categories(
     tenant_id: str = Query(...),
@@ -67,22 +155,9 @@ def create_category(
     ensure_tenant_access_is_active(payload.tenant_id)
 
     try:
-        supabase = get_supabase_admin()
+        category_payload = payload.model_dump()
 
-        response = (
-            supabase
-            .table("categories")
-            .insert(payload.model_dump())
-            .execute()
-        )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar categoria.",
-            )
-
-        category = response.data[0]
+        category = insert_category_with_fallback(category_payload)
 
         write_audit_log(
             tenant_id=payload.tenant_id,
@@ -101,8 +176,8 @@ def create_category(
         raise
     except Exception as error:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao criar categoria: {str(error)}",
         )
 
 
@@ -139,21 +214,7 @@ def update_category(
 
         update_data = payload.model_dump(exclude_unset=True)
 
-        response = (
-            supabase
-            .table("categories")
-            .update(update_data)
-            .eq("id", category_id)
-            .execute()
-        )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível atualizar categoria.",
-            )
-
-        category = response.data[0]
+        category = update_category_with_fallback(category_id, update_data)
 
         write_audit_log(
             tenant_id=tenant_id,
@@ -176,6 +237,6 @@ def update_category(
         raise
     except Exception as error:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao atualizar categoria: {str(error)}",
         )

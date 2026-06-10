@@ -50,10 +50,100 @@ def normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
     for key, value in data.items():
         if isinstance(value, Decimal):
             normalized[key] = str(value)
+        elif value == "":
+            normalized[key] = None
         else:
             normalized[key] = value
 
     return normalized
+
+
+def remove_column(payload: dict, column: str) -> dict:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != column
+    }
+
+
+def insert_product_with_fallback(payload: dict) -> dict:
+    supabase = get_supabase_admin()
+
+    attempts: list[dict] = []
+
+    attempts.append(payload)
+
+    if "active" in payload:
+        attempts.append({
+            **remove_column(payload, "active"),
+            "is_active": payload["active"],
+        })
+
+    attempts.append(remove_column(payload, "active"))
+
+    last_error = None
+
+    for current_payload in attempts:
+        try:
+            response = (
+                supabase
+                .table("products")
+                .insert(current_payload)
+                .execute()
+            )
+
+            if response.data:
+                return response.data[0]
+
+        except Exception as error:
+            last_error = error
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Não foi possível criar produto: {str(last_error)}",
+    )
+
+
+def update_product_with_fallback(product_id: str, payload: dict) -> dict:
+    supabase = get_supabase_admin()
+
+    attempts: list[dict] = []
+
+    attempts.append(payload)
+
+    if "active" in payload:
+        attempts.append({
+            **remove_column(payload, "active"),
+            "is_active": payload["active"],
+        })
+
+    attempts.append(remove_column(payload, "active"))
+
+    last_error = None
+
+    for current_payload in attempts:
+        if not current_payload:
+            continue
+
+        try:
+            response = (
+                supabase
+                .table("products")
+                .update(current_payload)
+                .eq("id", product_id)
+                .execute()
+            )
+
+            if response.data:
+                return response.data[0]
+
+        except Exception as error:
+            last_error = error
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Não foi possível atualizar produto: {str(last_error)}",
+    )
 
 
 @router.get("")
@@ -99,16 +189,27 @@ def get_product_by_barcode(
     try:
         supabase = get_supabase_admin()
 
-        response = (
-            supabase
-            .table("products")
-            .select("*")
-            .eq("tenant_id", tenant_id)
-            .eq("barcode", barcode)
-            .eq("active", True)
-            .limit(1)
-            .execute()
-        )
+        try:
+            response = (
+                supabase
+                .table("products")
+                .select("*")
+                .eq("tenant_id", tenant_id)
+                .eq("barcode", barcode)
+                .eq("active", True)
+                .limit(1)
+                .execute()
+            )
+        except Exception:
+            response = (
+                supabase
+                .table("products")
+                .select("*")
+                .eq("tenant_id", tenant_id)
+                .eq("barcode", barcode)
+                .limit(1)
+                .execute()
+            )
 
         if not response.data:
             raise HTTPException(
@@ -135,7 +236,7 @@ def create_product(
 ):
     ensure_safe_tenant_management(current_user, payload.tenant_id)
     ensure_tenant_access_is_active(payload.tenant_id)
-    ensure_product_limit_not_exceeded(payload.tenant_id)    
+    ensure_product_limit_not_exceeded(payload.tenant_id)
 
     try:
         supabase = get_supabase_admin()
@@ -159,20 +260,7 @@ def create_product(
 
         data = normalize_payload(payload.model_dump())
 
-        response = (
-            supabase
-            .table("products")
-            .insert(data)
-            .execute()
-        )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar produto.",
-            )
-
-        product = response.data[0]
+        product = insert_product_with_fallback(data)
 
         write_audit_log(
             tenant_id=payload.tenant_id,
@@ -191,8 +279,8 @@ def create_product(
         raise
     except Exception as error:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao criar produto: {str(error)}",
         )
 
 
@@ -247,21 +335,7 @@ def update_product(
                     detail="Já existe outro produto com este código de barras.",
                 )
 
-        response = (
-            supabase
-            .table("products")
-            .update(update_data)
-            .eq("id", product_id)
-            .execute()
-        )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível atualizar produto.",
-            )
-
-        product = response.data[0]
+        product = update_product_with_fallback(product_id, update_data)
 
         write_audit_log(
             tenant_id=tenant_id,
@@ -284,6 +358,6 @@ def update_product(
         raise
     except Exception as error:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao atualizar produto: {str(error)}",
         )
