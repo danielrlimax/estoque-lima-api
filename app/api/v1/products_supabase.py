@@ -11,6 +11,7 @@ from app.core.tenant_security import (
     ensure_safe_tenant_access,
     ensure_safe_tenant_management,
 )
+from app.core.plan_limits import ensure_product_limit_not_exceeded
 from app.db.supabase_client import get_supabase_admin
 
 router = APIRouter(prefix="/products", tags=["Products"])
@@ -134,6 +135,7 @@ def create_product(
 ):
     ensure_safe_tenant_management(current_user, payload.tenant_id)
     ensure_tenant_access_is_active(payload.tenant_id)
+    ensure_product_limit_not_exceeded(payload.tenant_id)    
 
     try:
         supabase = get_supabase_admin()

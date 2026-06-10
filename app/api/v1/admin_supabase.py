@@ -1,102 +1,103 @@
-import re
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
 
-from app.core.config import get_platform_admin_emails
+from app.core.audit import write_audit_log
+from app.core.plan_limits import ensure_user_limit_not_exceeded
 from app.core.security import get_current_user
+from app.core.tenant_security import require_platform_admin
 from app.db.supabase_client import get_supabase_admin
-from app.schemas.admin import (
-    AdminAddTenantMemberRequest,
-    AdminAsaasEventResponse,
-    AdminCouponCreateRequest,
-    AdminCouponResponse,
-    AdminCouponUpdateRequest,
-    AdminMeResponse,
-    AdminPlatformSummaryResponse,
-    AdminSubscriptionResponse,
-    AdminTenantCreateRequest,
-    AdminTenantMemberResponse,
-    AdminTenantResponse,
-    AdminUpdateSubscriptionStatusRequest,
-    AdminUpdateTenantStatusRequest,
-)
 
-router = APIRouter(prefix="/admin", tags=["Platform Admin"])
+router = APIRouter(prefix="/admin", tags=["Admin"])
 
 
-def require_platform_admin(current_user: dict):
-    allowed_emails = get_platform_admin_emails()
-    email = (current_user.get("email") or "").strip().lower()
-
-    if email not in allowed_emails:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso permitido apenas para administrador da plataforma.",
-        )
+class TenantCreateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    slug: str = Field(min_length=2, max_length=120)
+    status: str = "trialing"
+    owner_email: str | None = None
 
 
-def make_slug(value: str) -> str:
-    value = value.lower().strip()
-    value = re.sub(r"[^a-z0-9\s-]", "", value)
-    value = re.sub(r"\s+", "-", value)
-    value = re.sub(r"-+", "-", value)
-    return value.strip("-")
+class TenantStatusUpdateRequest(BaseModel):
+    status: str = Field(pattern="^(active|trialing|suspended|canceled|cancelled|banned)$")
 
 
-def validate_tenant_status(value: str):
-    allowed = {"trialing", "active", "suspended", "canceled", "banned"}
-
-    if value not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Status de estabelecimento inválido.",
-        )
+class AddTenantMemberRequest(BaseModel):
+    email: str
+    role: str = Field(pattern="^(owner|admin|manager|member)$")
 
 
-def validate_subscription_status(value: str):
-    allowed = {"trialing", "active", "past_due", "canceled", "expired"}
-
-    if value not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Status de assinatura inválido.",
-        )
+class SubscriptionStatusUpdateRequest(BaseModel):
+    status: str = Field(pattern="^(active|trialing|past_due|overdue|canceled|cancelled|suspended)$")
 
 
-def validate_role(value: str):
-    allowed = {"owner", "admin", "manager", "cashier", "viewer"}
-
-    if value not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Papel de usuário inválido.",
-        )
-
-
-def validate_coupon_type(value: str):
-    allowed = {"percentage", "fixed"}
-
-    if value not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tipo de cupom inválido.",
-        )
+class CouponCreateRequest(BaseModel):
+    code: str = Field(min_length=2, max_length=80)
+    description: str | None = None
+    discount_type: str = Field(pattern="^(percent|fixed)$")
+    discount_value: float = Field(ge=0)
+    max_redemptions: int | None = Field(default=None, ge=1)
+    active: bool = True
 
 
-@router.get("/me", response_model=AdminMeResponse)
-def get_admin_me(current_user: dict = Depends(get_current_user)):
-    require_platform_admin(current_user)
+class CouponUpdateRequest(BaseModel):
+    code: str | None = Field(default=None, min_length=2, max_length=80)
+    description: str | None = None
+    discount_type: str | None = Field(default=None, pattern="^(percent|fixed)$")
+    discount_value: float | None = Field(default=None, ge=0)
+    max_redemptions: int | None = Field(default=None, ge=1)
+    active: bool | None = None
 
+
+def get_profile_by_email(email: str) -> dict | None:
+    supabase = get_supabase_admin()
+
+    response = (
+        supabase
+        .table("profiles")
+        .select("*")
+        .eq("email", email.strip().lower())
+        .limit(1)
+        .execute()
+    )
+
+    if not response.data:
+        return None
+
+    return response.data[0]
+
+
+def normalize_coupon_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
-        "is_admin": True,
-        "email": current_user.get("email"),
+        key: value
+        for key, value in payload.items()
+        if value is not None
     }
 
 
-@router.get("/summary", response_model=AdminPlatformSummaryResponse)
-def get_platform_summary(current_user: dict = Depends(get_current_user)):
+@router.get("/me")
+def admin_me(current_user: dict = Depends(get_current_user)):
+    try:
+        require_platform_admin(current_user)
+
+        return {
+            "is_admin": True,
+            "email": current_user.get("email"),
+        }
+
+    except HTTPException as error:
+        if error.status_code == status.HTTP_403_FORBIDDEN:
+            return {
+                "is_admin": False,
+                "email": current_user.get("email"),
+            }
+
+        raise
+
+
+@router.get("/summary")
+def admin_summary(current_user: dict = Depends(get_current_user)):
     require_platform_admin(current_user)
 
     try:
@@ -105,25 +106,25 @@ def get_platform_summary(current_user: dict = Depends(get_current_user)):
         tenants_response = (
             supabase
             .table("tenants")
-            .select("id, status")
+            .select("id,status")
             .execute()
         )
 
         subscriptions_response = (
             supabase
             .table("subscriptions")
-            .select("id, status")
+            .select("id,status")
             .execute()
         )
 
         coupons_response = (
             supabase
             .table("coupons")
-            .select("id, active")
+            .select("id,active")
             .execute()
         )
 
-        events_response = (
+        asaas_events_response = (
             supabase
             .table("asaas_events")
             .select("id")
@@ -133,25 +134,41 @@ def get_platform_summary(current_user: dict = Depends(get_current_user)):
         tenants = tenants_response.data or []
         subscriptions = subscriptions_response.data or []
         coupons = coupons_response.data or []
-        events = events_response.data or []
+        asaas_events = asaas_events_response.data or []
+
+        def count_status(items: list[dict], statuses: set[str]) -> int:
+            return len([
+                item
+                for item in items
+                if item.get("status") in statuses
+            ])
 
         return {
             "total_tenants": len(tenants),
-            "active_tenants": len([t for t in tenants if t["status"] == "active"]),
-            "trialing_tenants": len([t for t in tenants if t["status"] == "trialing"]),
-            "suspended_tenants": len([t for t in tenants if t["status"] == "suspended"]),
-            "canceled_tenants": len([t for t in tenants if t["status"] == "canceled"]),
-            "banned_tenants": len([t for t in tenants if t["status"] == "banned"]),
+            "active_tenants": count_status(tenants, {"active"}),
+            "trialing_tenants": count_status(tenants, {"trialing"}),
+            "suspended_tenants": count_status(tenants, {"suspended"}),
+            "canceled_tenants": count_status(tenants, {"canceled", "cancelled"}),
+            "banned_tenants": count_status(tenants, {"banned"}),
+
             "total_subscriptions": len(subscriptions),
-            "active_subscriptions": len([s for s in subscriptions if s["status"] == "active"]),
-            "trialing_subscriptions": len([s for s in subscriptions if s["status"] == "trialing"]),
-            "past_due_subscriptions": len([s for s in subscriptions if s["status"] == "past_due"]),
-            "canceled_subscriptions": len([s for s in subscriptions if s["status"] == "canceled"]),
+            "active_subscriptions": count_status(subscriptions, {"active"}),
+            "trialing_subscriptions": count_status(subscriptions, {"trialing"}),
+            "past_due_subscriptions": count_status(subscriptions, {"past_due", "overdue"}),
+            "canceled_subscriptions": count_status(subscriptions, {"canceled", "cancelled"}),
+
             "total_coupons": len(coupons),
-            "active_coupons": len([c for c in coupons if c["active"]]),
-            "total_asaas_events": len(events),
+            "active_coupons": len([
+                coupon
+                for coupon in coupons
+                if coupon.get("active") is True
+            ]),
+
+            "total_asaas_events": len(asaas_events),
         }
 
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -159,11 +176,8 @@ def get_platform_summary(current_user: dict = Depends(get_current_user)):
         )
 
 
-@router.get("/tenants", response_model=list[AdminTenantResponse])
-def list_platform_tenants(
-    limit: int = Query(default=100, ge=1, le=500),
-    current_user: dict = Depends(get_current_user),
-):
+@router.get("/tenants")
+def list_tenants(current_user: dict = Depends(get_current_user)):
     require_platform_admin(current_user)
 
     try:
@@ -172,9 +186,8 @@ def list_platform_tenants(
         response = (
             supabase
             .table("tenants")
-            .select("id, name, slug, email, phone, document, status, created_at")
+            .select("*")
             .order("created_at", desc=True)
-            .limit(limit)
             .execute()
         )
 
@@ -187,28 +200,38 @@ def list_platform_tenants(
         )
 
 
-@router.post("/tenants", response_model=AdminTenantResponse)
-def create_platform_tenant(
-    payload: AdminTenantCreateRequest,
+@router.post("/tenants")
+def create_tenant(
+    payload: TenantCreateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     require_platform_admin(current_user)
-    validate_tenant_status(payload.status)
 
     try:
         supabase = get_supabase_admin()
 
-        slug = make_slug(payload.slug or payload.name)
+        existing = (
+            supabase
+            .table("tenants")
+            .select("id")
+            .eq("slug", payload.slug)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Já existe um estabelecimento com este slug.",
+            )
 
         tenant_response = (
             supabase
             .table("tenants")
             .insert({
                 "name": payload.name,
-                "slug": slug,
-                "email": str(payload.email) if payload.email else None,
-                "phone": payload.phone,
-                "document": payload.document,
+                "slug": payload.slug,
                 "status": payload.status,
             })
             .execute()
@@ -217,62 +240,113 @@ def create_platform_tenant(
         if not tenant_response.data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar o estabelecimento.",
+                detail="Não foi possível criar estabelecimento.",
             )
 
         tenant = tenant_response.data[0]
 
-        plan_response = (
+        owner_profile = None
+
+        if payload.owner_email:
+            owner_profile = get_profile_by_email(payload.owner_email)
+
+            if not owner_profile:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Usuário dono não encontrado. Ele precisa criar conta antes.",
+                )
+
+            supabase.table("tenant_members").insert({
+                "tenant_id": tenant["id"],
+                "user_id": owner_profile["id"],
+                "role": "owner",
+            }).execute()
+
+        write_audit_log(
+            action="tenant.create",
+            entity_type="tenant",
+            entity_id=tenant.get("id"),
+            description=f"Estabelecimento criado: {tenant.get('name')}",
+            metadata={
+                "tenant": tenant,
+                "owner_email": payload.owner_email,
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return {
+            "tenant": tenant,
+            "owner": owner_profile,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        )
+
+
+@router.patch("/tenants/{tenant_id}/status")
+def update_tenant_status(
+    tenant_id: str,
+    payload: TenantStatusUpdateRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    require_platform_admin(current_user)
+
+    try:
+        supabase = get_supabase_admin()
+
+        old_response = (
             supabase
-            .table("plans")
-            .select("id")
-            .eq("code", "starter")
+            .table("tenants")
+            .select("*")
+            .eq("id", tenant_id)
             .limit(1)
             .execute()
         )
 
-        if plan_response.data:
-            plan_id = plan_response.data[0]["id"]
-            trial_end = datetime.now(timezone.utc) + timedelta(days=7)
-
-            existing_subscription = (
-                supabase
-                .table("subscriptions")
-                .select("id")
-                .eq("tenant_id", tenant["id"])
-                .limit(1)
-                .execute()
+        if not old_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Estabelecimento não encontrado.",
             )
 
-            if not existing_subscription.data:
-                supabase.table("subscriptions").insert({
-                    "tenant_id": tenant["id"],
-                    "plan_id": plan_id,
-                    "status": "trialing",
-                    "provider": "manual",
-                    "trial_ends_at": trial_end.isoformat(),
-                    "current_period_end": trial_end.isoformat(),
-                }).execute()
+        old_tenant = old_response.data[0]
 
-        if payload.owner_email:
-            profile_response = (
-                supabase
-                .table("profiles")
-                .select("id, email")
-                .eq("email", str(payload.owner_email))
-                .limit(1)
-                .execute()
+        response = (
+            supabase
+            .table("tenants")
+            .update({"status": payload.status})
+            .eq("id", tenant_id)
+            .execute()
+        )
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível atualizar estabelecimento.",
             )
 
-            if profile_response.data:
-                owner_profile = profile_response.data[0]
+        tenant = response.data[0]
 
-                supabase.table("tenant_members").upsert({
-                    "tenant_id": tenant["id"],
-                    "user_id": owner_profile["id"],
-                    "role": "owner",
-                    "active": True,
-                }).execute()
+        write_audit_log(
+            tenant_id=tenant_id,
+            action="tenant.status_update",
+            entity_type="tenant",
+            entity_id=tenant_id,
+            description=f"Status alterado para {payload.status}",
+            metadata={
+                "before": old_tenant,
+                "after": tenant,
+            },
+            current_user=current_user,
+            request=request,
+        )
 
         return tenant
 
@@ -285,83 +359,66 @@ def create_platform_tenant(
         )
 
 
-@router.patch("/tenants/{tenant_id}/status", response_model=AdminTenantResponse)
-def update_tenant_status(
+@router.post("/tenants/{tenant_id}/members")
+def add_tenant_member(
     tenant_id: str,
-    payload: AdminUpdateTenantStatusRequest,
+    payload: AddTenantMemberRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     require_platform_admin(current_user)
-    validate_tenant_status(payload.status)
 
     try:
         supabase = get_supabase_admin()
 
-        response = (
+        tenant_response = (
             supabase
             .table("tenants")
-            .update({"status": payload.status})
+            .select("*")
             .eq("id", tenant_id)
+            .limit(1)
             .execute()
         )
 
-        if not response.data:
+        if not tenant_response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Estabelecimento não encontrado.",
             )
 
-        return response.data[0]
+        ensure_user_limit_not_exceeded(tenant_id)
 
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
-        )
+        profile = get_profile_by_email(payload.email)
 
+        if not profile:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Usuário não encontrado. Ele precisa criar conta antes.",
+            )
 
-@router.post(
-    "/tenants/{tenant_id}/members",
-    response_model=AdminTenantMemberResponse,
-)
-def add_tenant_member(
-    tenant_id: str,
-    payload: AdminAddTenantMemberRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    require_platform_admin(current_user)
-    validate_role(payload.role)
-
-    try:
-        supabase = get_supabase_admin()
-
-        profile_response = (
+        existing_member = (
             supabase
-            .table("profiles")
-            .select("id, email")
-            .eq("email", str(payload.email))
+            .table("tenant_members")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("user_id", profile["id"])
             .limit(1)
             .execute()
         )
 
-        if not profile_response.data:
+        if existing_member.data:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Usuário não encontrado em profiles. Peça para ele criar conta primeiro.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Este usuário já faz parte do estabelecimento.",
             )
-
-        profile = profile_response.data[0]
 
         response = (
             supabase
             .table("tenant_members")
-            .upsert({
+            .insert({
                 "tenant_id": tenant_id,
                 "user_id": profile["id"],
                 "role": payload.role,
-                "active": True,
             })
             .execute()
         )
@@ -369,10 +426,30 @@ def add_tenant_member(
         if not response.data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível adicionar membro ao estabelecimento.",
+                detail="Não foi possível adicionar membro.",
             )
 
-        return response.data[0]
+        member = response.data[0]
+
+        write_audit_log(
+            tenant_id=tenant_id,
+            action="tenant.member_add",
+            entity_type="tenant_member",
+            entity_id=member.get("id"),
+            description=f"Membro adicionado: {payload.email}",
+            metadata={
+                "member": member,
+                "email": payload.email,
+                "role": payload.role,
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return {
+            "member": member,
+            "profile": profile,
+        }
 
     except HTTPException:
         raise
@@ -383,11 +460,8 @@ def add_tenant_member(
         )
 
 
-@router.get("/subscriptions", response_model=list[AdminSubscriptionResponse])
-def list_platform_subscriptions(
-    limit: int = Query(default=100, ge=1, le=500),
-    current_user: dict = Depends(get_current_user),
-):
+@router.get("/subscriptions")
+def list_subscriptions(current_user: dict = Depends(get_current_user)):
     require_platform_admin(current_user)
 
     try:
@@ -396,126 +470,8 @@ def list_platform_subscriptions(
         response = (
             supabase
             .table("subscriptions")
-            .select(
-                "id, tenant_id, status, provider, asaas_customer_id, "
-                "asaas_subscription_id, trial_ends_at, current_period_end, "
-                "created_at, tenants(name)"
-            )
+            .select("*")
             .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-
-        result = []
-
-        for item in response.data or []:
-            tenant = item.get("tenants") or {}
-
-            result.append({
-                "id": item["id"],
-                "tenant_id": item["tenant_id"],
-                "tenant_name": tenant.get("name"),
-                "status": item["status"],
-                "provider": item["provider"],
-                "asaas_customer_id": item.get("asaas_customer_id"),
-                "asaas_subscription_id": item.get("asaas_subscription_id"),
-                "trial_ends_at": item.get("trial_ends_at"),
-                "current_period_end": item.get("current_period_end"),
-                "created_at": item["created_at"],
-            })
-
-        return result
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
-        )
-
-
-@router.patch("/subscriptions/{subscription_id}/status", response_model=AdminSubscriptionResponse)
-def update_subscription_status(
-    subscription_id: str,
-    payload: AdminUpdateSubscriptionStatusRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    require_platform_admin(current_user)
-    validate_subscription_status(payload.status)
-
-    try:
-        supabase = get_supabase_admin()
-
-        response = (
-            supabase
-            .table("subscriptions")
-            .update({"status": payload.status})
-            .eq("id", subscription_id)
-            .execute()
-        )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Assinatura não encontrada.",
-            )
-
-        item = response.data[0]
-
-        tenant_response = (
-            supabase
-            .table("tenants")
-            .select("name")
-            .eq("id", item["tenant_id"])
-            .limit(1)
-            .execute()
-        )
-
-        tenant_name = None
-
-        if tenant_response.data:
-            tenant_name = tenant_response.data[0].get("name")
-
-        return {
-            "id": item["id"],
-            "tenant_id": item["tenant_id"],
-            "tenant_name": tenant_name,
-            "status": item["status"],
-            "provider": item["provider"],
-            "asaas_customer_id": item.get("asaas_customer_id"),
-            "asaas_subscription_id": item.get("asaas_subscription_id"),
-            "trial_ends_at": item.get("trial_ends_at"),
-            "current_period_end": item.get("current_period_end"),
-            "created_at": item["created_at"],
-        }
-
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
-        )
-
-
-@router.get("/coupons", response_model=list[AdminCouponResponse])
-def list_coupons(
-    limit: int = Query(default=100, ge=1, le=500),
-    current_user: dict = Depends(get_current_user),
-):
-    require_platform_admin(current_user)
-
-    try:
-        supabase = get_supabase_admin()
-
-        response = (
-            supabase
-            .table("coupons")
-            .select(
-                "id, code, description, type, value, active, max_uses, "
-                "used_count, valid_from, valid_until, created_at"
-            )
-            .order("created_at", desc=True)
-            .limit(limit)
             .execute()
         )
 
@@ -528,43 +484,66 @@ def list_coupons(
         )
 
 
-@router.post("/coupons", response_model=AdminCouponResponse)
-def create_coupon(
-    payload: AdminCouponCreateRequest,
+@router.patch("/subscriptions/{subscription_id}/status")
+def update_subscription_status(
+    subscription_id: str,
+    payload: SubscriptionStatusUpdateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     require_platform_admin(current_user)
-    validate_coupon_type(payload.type)
 
     try:
         supabase = get_supabase_admin()
 
-        code = payload.code.strip().upper()
+        old_response = (
+            supabase
+            .table("subscriptions")
+            .select("*")
+            .eq("id", subscription_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not old_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Assinatura não encontrada.",
+            )
+
+        old_subscription = old_response.data[0]
 
         response = (
             supabase
-            .table("coupons")
-            .insert({
-                "code": code,
-                "description": payload.description,
-                "type": payload.type,
-                "value": str(payload.value),
-                "active": payload.active,
-                "max_uses": payload.max_uses,
-                "used_count": 0,
-                "valid_from": payload.valid_from,
-                "valid_until": payload.valid_until,
-            })
+            .table("subscriptions")
+            .update({"status": payload.status})
+            .eq("id", subscription_id)
             .execute()
         )
 
         if not response.data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar cupom.",
+                detail="Não foi possível atualizar assinatura.",
             )
 
-        return response.data[0]
+        subscription = response.data[0]
+
+        write_audit_log(
+            tenant_id=subscription.get("tenant_id"),
+            action="subscription.status_update",
+            entity_type="subscription",
+            entity_id=subscription_id,
+            description=f"Status da assinatura alterado para {payload.status}",
+            metadata={
+                "before": old_subscription,
+                "after": subscription,
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return subscription
 
     except HTTPException:
         raise
@@ -575,10 +554,34 @@ def create_coupon(
         )
 
 
-@router.patch("/coupons/{coupon_id}", response_model=AdminCouponResponse)
-def update_coupon(
-    coupon_id: str,
-    payload: AdminCouponUpdateRequest,
+@router.get("/coupons")
+def list_coupons(current_user: dict = Depends(get_current_user)):
+    require_platform_admin(current_user)
+
+    try:
+        supabase = get_supabase_admin()
+
+        response = (
+            supabase
+            .table("coupons")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        )
+
+
+@router.post("/coupons")
+def create_coupon(
+    payload: CouponCreateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     require_platform_admin(current_user)
@@ -586,13 +589,115 @@ def update_coupon(
     try:
         supabase = get_supabase_admin()
 
-        update_data = payload.model_dump(exclude_unset=True)
+        code = payload.code.strip().upper()
 
-        if "type" in update_data and update_data["type"] is not None:
-            validate_coupon_type(update_data["type"])
+        existing = (
+            supabase
+            .table("coupons")
+            .select("id")
+            .eq("code", code)
+            .limit(1)
+            .execute()
+        )
 
-        if "value" in update_data and isinstance(update_data["value"], Decimal):
-            update_data["value"] = str(update_data["value"])
+        if existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Já existe um cupom com este código.",
+            )
+
+        response = (
+            supabase
+            .table("coupons")
+            .insert({
+                "code": code,
+                "description": payload.description,
+                "discount_type": payload.discount_type,
+                "discount_value": payload.discount_value,
+                "max_redemptions": payload.max_redemptions,
+                "active": payload.active,
+            })
+            .execute()
+        )
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível criar cupom.",
+            )
+
+        coupon = response.data[0]
+
+        write_audit_log(
+            action="coupon.create",
+            entity_type="coupon",
+            entity_id=coupon.get("id"),
+            description=f"Cupom criado: {coupon.get('code')}",
+            metadata={"coupon": coupon},
+            current_user=current_user,
+            request=request,
+        )
+
+        return coupon
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        )
+
+
+@router.patch("/coupons/{coupon_id}")
+def update_coupon(
+    coupon_id: str,
+    payload: CouponUpdateRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    require_platform_admin(current_user)
+
+    try:
+        supabase = get_supabase_admin()
+
+        old_response = (
+            supabase
+            .table("coupons")
+            .select("*")
+            .eq("id", coupon_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not old_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Cupom não encontrado.",
+            )
+
+        old_coupon = old_response.data[0]
+
+        update_data = normalize_coupon_payload(payload.model_dump(exclude_unset=True))
+
+        if "code" in update_data and update_data["code"]:
+            update_data["code"] = update_data["code"].strip().upper()
+
+            existing = (
+                supabase
+                .table("coupons")
+                .select("id")
+                .eq("code", update_data["code"])
+                .neq("id", coupon_id)
+                .limit(1)
+                .execute()
+            )
+
+            if existing.data:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Já existe outro cupom com este código.",
+                )
 
         response = (
             supabase
@@ -604,11 +709,27 @@ def update_coupon(
 
         if not response.data:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Cupom não encontrado.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível atualizar cupom.",
             )
 
-        return response.data[0]
+        coupon = response.data[0]
+
+        write_audit_log(
+            action="coupon.update",
+            entity_type="coupon",
+            entity_id=coupon_id,
+            description=f"Cupom atualizado: {coupon.get('code')}",
+            metadata={
+                "before": old_coupon,
+                "changes": update_data,
+                "after": coupon,
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return coupon
 
     except HTTPException:
         raise
@@ -619,15 +740,33 @@ def update_coupon(
         )
 
 
-@router.delete("/coupons/{coupon_id}", response_model=AdminCouponResponse)
+@router.delete("/coupons/{coupon_id}")
 def disable_coupon(
     coupon_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     require_platform_admin(current_user)
 
     try:
         supabase = get_supabase_admin()
+
+        old_response = (
+            supabase
+            .table("coupons")
+            .select("*")
+            .eq("id", coupon_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not old_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Cupom não encontrado.",
+            )
+
+        old_coupon = old_response.data[0]
 
         response = (
             supabase
@@ -639,11 +778,26 @@ def disable_coupon(
 
         if not response.data:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Cupom não encontrado.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível desativar cupom.",
             )
 
-        return response.data[0]
+        coupon = response.data[0]
+
+        write_audit_log(
+            action="coupon.disable",
+            entity_type="coupon",
+            entity_id=coupon_id,
+            description=f"Cupom desativado: {old_coupon.get('code')}",
+            metadata={
+                "before": old_coupon,
+                "after": coupon,
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return coupon
 
     except HTTPException:
         raise
@@ -654,11 +808,8 @@ def disable_coupon(
         )
 
 
-@router.get("/asaas-events", response_model=list[AdminAsaasEventResponse])
-def list_asaas_events(
-    limit: int = Query(default=100, ge=1, le=500),
-    current_user: dict = Depends(get_current_user),
-):
+@router.get("/asaas-events")
+def list_asaas_events(current_user: dict = Depends(get_current_user)):
     require_platform_admin(current_user)
 
     try:
@@ -667,12 +818,9 @@ def list_asaas_events(
         response = (
             supabase
             .table("asaas_events")
-            .select(
-                "id, event_id, event_type, payment_id, subscription_id, "
-                "customer_id, processed, processed_at, created_at"
-            )
+            .select("*")
             .order("created_at", desc=True)
-            .limit(limit)
+            .limit(100)
             .execute()
         )
 
