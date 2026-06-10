@@ -168,16 +168,22 @@ def get_default_plan() -> dict:
     )
 
 
-def insert_tenant(payload: TenantCreateRequest, slug: str) -> dict:
+def insert_tenant(
+    payload: TenantCreateRequest,
+    slug: str,
+    owner_user_id: str,
+) -> dict:
     supabase = get_supabase_admin()
 
     full_payload = {
         "name": payload.name.strip(),
         "slug": slug,
+        "owner_user_id": owner_user_id,
         "email": normalize_email(payload.email),
         "phone": clean_text(payload.phone),
         "document": clean_text(payload.document),
         "status": payload.status,
+        "metadata": {},
     }
 
     full_payload = {
@@ -197,22 +203,34 @@ def insert_tenant(payload: TenantCreateRequest, slug: str) -> dict:
         if response.data:
             return response.data[0]
 
-    except Exception:
+    except Exception as first_error:
         minimal_payload = {
             "name": payload.name.strip(),
             "slug": slug,
+            "owner_user_id": owner_user_id,
             "status": payload.status,
         }
 
-        response = (
-            supabase
-            .table("tenants")
-            .insert(minimal_payload)
-            .execute()
-        )
+        try:
+            response = (
+                supabase
+                .table("tenants")
+                .insert(minimal_payload)
+                .execute()
+            )
 
-        if response.data:
-            return response.data[0]
+            if response.data:
+                return response.data[0]
+
+        except Exception as second_error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Não foi possível criar estabelecimento.",
+                    "first_error": str(first_error),
+                    "second_error": str(second_error),
+                },
+            )
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -489,14 +507,20 @@ def create_tenant(
                 detail="Não foi possível identificar o dono do estabelecimento.",
             )
 
+        owner_user_id = str(owner_user_id)
+
         slug = get_unique_slug(payload.slug or payload.name)
         plan = get_default_plan()
 
-        tenant = insert_tenant(payload, slug)
+        tenant = insert_tenant(
+            payload=payload,
+            slug=slug,
+            owner_user_id=owner_user_id,
+        )
 
         owner_member = add_owner_member(
             tenant_id=tenant["id"],
-            owner_user_id=str(owner_user_id),
+            owner_user_id=owner_user_id,
         )
 
         if not owner_member:
