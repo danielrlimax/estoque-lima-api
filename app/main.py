@@ -1,13 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import settings
 from app.api.v1.router import api_router
+from app.core.config import settings
 
 app = FastAPI(
     title=settings.APP_NAME,
     debug=settings.APP_DEBUG,
-    version="1.0.0",
 )
 
 allowed_origins = [
@@ -28,10 +27,16 @@ app.include_router(api_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/")
-async def root():
+def root():
+    if settings.APP_ENV == "production":
+        return {
+            "app": settings.APP_NAME,
+            "status": "online",
+        }
+
     return {
-        "name": settings.APP_NAME,
-        "version": "1.0.0",
-        "env": settings.APP_ENV,
-        "docs": "/docs" if settings.APP_ENV == "local" else None,
+        "app": settings.APP_NAME,
+        "status": "online",
+        "docs": "/docs",
+        "api": settings.API_PREFIX,
     }

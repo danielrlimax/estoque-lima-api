@@ -21,6 +21,11 @@ class Settings(BaseSettings):
 
     PLATFORM_ADMIN_EMAILS: str = "d175259@dac.unicamp.br"
 
+    COOKIE_ACCESS_NAME: str = "limastock_access_token"
+    COOKIE_REFRESH_NAME: str = "limastock_refresh_token"
+    COOKIE_SECURE: bool = False
+    COOKIE_SAMESITE: str = "lax"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

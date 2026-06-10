@@ -12,8 +12,5 @@ class AuthUserResponse(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    access_token: str
-    refresh_token: str | None = None
-    token_type: str = "bearer"
-    expires_at: int | None = None
+    authenticated: bool
     user: AuthUserResponse
