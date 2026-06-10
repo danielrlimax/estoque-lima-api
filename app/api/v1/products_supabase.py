@@ -1,8 +1,9 @@
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from app.core.audit import write_audit_log
 from app.core.security import get_current_user
 from app.core.subscription_guard import ensure_tenant_access_is_active
 from app.db.supabase_client import get_supabase_admin, get_supabase_with_token
@@ -125,6 +126,7 @@ def get_product_by_barcode(
 @router.post("")
 def create_product(
     payload: ProductCreateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     ensure_tenant_access_is_active(payload.tenant_id)
@@ -147,7 +149,25 @@ def create_product(
                 detail="Não foi possível criar produto.",
             )
 
-        return response.data[0]
+        product = response.data[0]
+
+        write_audit_log(
+            action="product.create",
+            entity_type="product",
+            tenant_id=payload.tenant_id,
+            entity_id=product["id"],
+            description=f"Produto criado: {product.get('name')}",
+            metadata={
+                "name": product.get("name"),
+                "barcode": product.get("barcode"),
+                "sale_price": product.get("sale_price"),
+                "current_stock": product.get("current_stock"),
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return product
 
     except HTTPException:
         raise
@@ -162,6 +182,7 @@ def create_product(
 def update_product(
     product_id: str,
     payload: ProductUpdateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     try:
@@ -170,7 +191,7 @@ def update_product(
         product_response = (
             supabase_admin
             .table("products")
-            .select("id, tenant_id")
+            .select("*")
             .eq("id", product_id)
             .limit(1)
             .execute()
@@ -182,7 +203,8 @@ def update_product(
                 detail="Produto não encontrado.",
             )
 
-        tenant_id = product_response.data[0]["tenant_id"]
+        old_product = product_response.data[0]
+        tenant_id = old_product["tenant_id"]
 
         ensure_tenant_access_is_active(tenant_id)
 
@@ -207,7 +229,24 @@ def update_product(
                 detail="Não foi possível atualizar produto.",
             )
 
-        return response.data[0]
+        product = response.data[0]
+
+        write_audit_log(
+            action="product.update",
+            entity_type="product",
+            tenant_id=tenant_id,
+            entity_id=product_id,
+            description=f"Produto atualizado: {product.get('name')}",
+            metadata={
+                "before": old_product,
+                "changes": update_data,
+                "after": product,
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return product
 
     except HTTPException:
         raise

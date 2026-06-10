@@ -1,8 +1,9 @@
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from app.core.audit import write_audit_log
 from app.core.security import get_current_user
 from app.core.subscription_guard import ensure_tenant_access_is_active
 from app.db.supabase_client import get_supabase_admin
@@ -117,6 +118,7 @@ def get_sale(
 @router.post("")
 def create_sale(
     payload: SaleCreateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     validate_payment_method(payload.payment_method)
@@ -189,6 +191,7 @@ def create_sale(
 
             stock_updates.append({
                 "product_id": product["id"],
+                "product_name": product["name"],
                 "previous_stock": str(current_stock),
                 "new_stock": str(new_stock),
                 "quantity": str(quantity),
@@ -261,6 +264,26 @@ def create_sale(
                 "reason": f"Venda #{sale['id']}",
                 "created_by": current_user.get("id"),
             }).execute()
+
+        write_audit_log(
+            action="sale.create",
+            entity_type="sale",
+            tenant_id=payload.tenant_id,
+            entity_id=sale["id"],
+            description=f"Venda finalizada no valor de R$ {total}.",
+            metadata={
+                "sale_id": sale["id"],
+                "payment_method": payload.payment_method,
+                "customer_name": payload.customer_name,
+                "subtotal": str(subtotal),
+                "discount": str(discount),
+                "total": str(total),
+                "items": sale_items_with_sale_id,
+                "stock_updates": stock_updates,
+            },
+            current_user=current_user,
+            request=request,
+        )
 
         return {
             **sale,

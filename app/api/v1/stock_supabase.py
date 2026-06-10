@@ -1,112 +1,175 @@
-from decimal import Decimal
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from app.core.audit import write_audit_log
 from app.core.security import get_current_user
 from app.core.subscription_guard import ensure_tenant_access_is_active
-from app.db.supabase_client import get_supabase_admin
+from app.db.supabase_client import get_supabase_admin, get_supabase_with_token
 
-router = APIRouter(prefix="/stock", tags=["Stock"])
+router = APIRouter(prefix="/categories", tags=["Categories"])
 
 
-class StockAdjustRequest(BaseModel):
+class CategoryCreateRequest(BaseModel):
     tenant_id: str
-    product_id: str
-    type: str
-    quantity: Decimal = Field(gt=0)
-    reason: str | None = None
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = None
+    active: bool = True
 
 
-def validate_movement_type(value: str):
-    allowed = {"in", "out", "adjustment"}
+class CategoryUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    description: str | None = None
+    active: bool | None = None
 
-    if value not in allowed:
+
+@router.get("")
+def list_categories(
+    tenant_id: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_tenant_access_is_active(tenant_id)
+
+    try:
+        supabase = get_supabase_with_token(current_user["access_token"])
+
+        response = (
+            supabase
+            .table("categories")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return response.data or []
+
+    except HTTPException:
+        raise
+    except Exception as error:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tipo de movimentação inválido.",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
         )
 
 
-@router.post("/adjust")
-def adjust_stock(
-    payload: StockAdjustRequest,
+@router.post("")
+def create_category(
+    payload: CategoryCreateRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    validate_movement_type(payload.type)
     ensure_tenant_access_is_active(payload.tenant_id)
 
     try:
-        supabase = get_supabase_admin()
+        supabase = get_supabase_with_token(current_user["access_token"])
 
-        product_response = (
+        response = (
             supabase
-            .table("products")
-            .select("id, tenant_id, current_stock")
-            .eq("id", payload.product_id)
-            .eq("tenant_id", payload.tenant_id)
+            .table("categories")
+            .insert(payload.model_dump())
+            .execute()
+        )
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível criar categoria.",
+            )
+
+        category = response.data[0]
+
+        write_audit_log(
+            action="category.create",
+            entity_type="category",
+            tenant_id=payload.tenant_id,
+            entity_id=category["id"],
+            description=f"Categoria criada: {category.get('name')}",
+            metadata={
+                "name": category.get("name"),
+                "description": category.get("description"),
+                "active": category.get("active"),
+            },
+            current_user=current_user,
+            request=request,
+        )
+
+        return category
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        )
+
+
+@router.patch("/{category_id}")
+def update_category(
+    category_id: str,
+    payload: CategoryUpdateRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        supabase_admin = get_supabase_admin()
+
+        category_response = (
+            supabase_admin
+            .table("categories")
+            .select("*")
+            .eq("id", category_id)
             .limit(1)
             .execute()
         )
 
-        if not product_response.data:
+        if not category_response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Produto não encontrado.",
+                detail="Categoria não encontrada.",
             )
 
-        product = product_response.data[0]
-        current_stock = Decimal(str(product["current_stock"]))
-        quantity = payload.quantity
+        old_category = category_response.data[0]
+        tenant_id = old_category["tenant_id"]
 
-        if payload.type == "in":
-            new_stock = current_stock + quantity
-        elif payload.type == "out":
-            if quantity > current_stock:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Estoque insuficiente para saída.",
-                )
+        ensure_tenant_access_is_active(tenant_id)
 
-            new_stock = current_stock - quantity
-        else:
-            new_stock = quantity
+        update_data = payload.model_dump(exclude_unset=True)
 
-        product_update_response = (
+        supabase = get_supabase_with_token(current_user["access_token"])
+
+        response = (
             supabase
-            .table("products")
-            .update({"current_stock": str(new_stock)})
-            .eq("id", payload.product_id)
-            .eq("tenant_id", payload.tenant_id)
+            .table("categories")
+            .update(update_data)
+            .eq("id", category_id)
             .execute()
         )
 
-        if not product_update_response.data:
+        if not response.data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível atualizar estoque.",
+                detail="Não foi possível atualizar categoria.",
             )
 
-        movement_response = (
-            supabase
-            .table("stock_movements")
-            .insert({
-                "tenant_id": payload.tenant_id,
-                "product_id": payload.product_id,
-                "type": payload.type,
-                "quantity": str(quantity),
-                "previous_stock": str(current_stock),
-                "new_stock": str(new_stock),
-                "reason": payload.reason,
-                "created_by": current_user.get("id"),
-            })
-            .execute()
+        category = response.data[0]
+
+        write_audit_log(
+            action="category.update",
+            entity_type="category",
+            tenant_id=tenant_id,
+            entity_id=category_id,
+            description=f"Categoria atualizada: {category.get('name')}",
+            metadata={
+                "before": old_category,
+                "changes": update_data,
+                "after": category,
+            },
+            current_user=current_user,
+            request=request,
         )
 
-        return {
-            "product": product_update_response.data[0],
-            "movement": movement_response.data[0] if movement_response.data else None,
-        }
+        return category
 
     except HTTPException:
         raise
