@@ -1,111 +1,83 @@
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.core.security import get_current_user
-from app.db.supabase_client import get_supabase_with_token
-from app.schemas.sale import SaleCreate, SaleResponse
+from app.core.subscription_guard import ensure_tenant_access_is_active
+from app.db.supabase_client import get_supabase_admin
 
 router = APIRouter(prefix="/sales", tags=["Sales"])
 
 
-@router.post("", response_model=SaleResponse, status_code=status.HTTP_201_CREATED)
-def create_sale(
-    payload: SaleCreate,
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+class SaleItemRequest(BaseModel):
+    product_id: str
+    quantity: Decimal = Field(gt=0)
 
-        items = [
-            {
-                "product_id": item.product_id,
-                "quantity": float(item.quantity),
-            }
-            for item in payload.items
-        ]
 
-        response = (
-            supabase
-            .rpc(
-                "create_sale",
-                {
-                    "p_tenant_id": payload.tenant_id,
-                    "p_items": items,
-                    "p_payment_method": payload.payment_method,
-                    "p_discount": float(payload.discount),
-                    "p_customer_name": payload.customer_name,
-                    "p_notes": payload.notes,
-                },
-            )
-            .execute()
+class SaleCreateRequest(BaseModel):
+    tenant_id: str
+    items: list[SaleItemRequest]
+    payment_method: str
+    discount: Decimal = Field(default=0, ge=0)
+    customer_name: str | None = None
+    notes: str | None = None
+
+
+def validate_payment_method(value: str):
+    allowed = {"cash", "pix", "credit_card", "debit_card"}
+
+    if value not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Forma de pagamento inválida.",
         )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar a venda.",
-            )
-
-        return {
-            "sale_id": str(response.data["sale_id"]),
-            "subtotal": Decimal(str(response.data["subtotal"])),
-            "discount": Decimal(str(response.data["discount"])),
-            "total": Decimal(str(response.data["total"])),
-        }
-
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=400, detail=str(error))
 
 
 @router.get("")
 def list_sales(
     tenant_id: str = Query(...),
-    limit: int = Query(default=50, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_tenant_access_is_active(tenant_id)
+
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
         response = (
             supabase
             .table("sales")
-            .select(
-                "id, tenant_id, status, payment_method, subtotal, discount, "
-                "total, customer_name, notes, created_by, created_at"
-            )
+            .select("*")
             .eq("tenant_id", tenant_id)
             .order("created_at", desc=True)
-            .limit(limit)
+            .limit(100)
             .execute()
         )
 
-        return response.data
+        return response.data or []
 
+    except HTTPException:
+        raise
     except Exception as error:
-        raise HTTPException(status_code=500, detail=str(error))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        )
 
 
 @router.get("/{sale_id}")
 def get_sale(
     sale_id: str,
-    tenant_id: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
     try:
-        supabase = get_supabase_with_token(current_user["access_token"])
+        supabase = get_supabase_admin()
 
         sale_response = (
             supabase
             .table("sales")
-            .select(
-                "id, tenant_id, status, payment_method, subtotal, discount, "
-                "total, customer_name, notes, created_by, created_at"
-            )
+            .select("*")
             .eq("id", sale_id)
-            .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
         )
@@ -116,24 +88,189 @@ def get_sale(
                 detail="Venda não encontrada.",
             )
 
+        sale = sale_response.data[0]
+
+        ensure_tenant_access_is_active(sale["tenant_id"])
+
         items_response = (
             supabase
             .table("sale_items")
-            .select(
-                "id, product_id, product_name, barcode, quantity, unit_price, total, created_at"
-            )
+            .select("*")
             .eq("sale_id", sale_id)
-            .eq("tenant_id", tenant_id)
-            .order("created_at")
             .execute()
         )
 
         return {
-            "sale": sale_response.data[0],
-            "items": items_response.data,
+            **sale,
+            "items": items_response.data or [],
         }
 
     except HTTPException:
         raise
     except Exception as error:
-        raise HTTPException(status_code=500, detail=str(error))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        )
+
+
+@router.post("")
+def create_sale(
+    payload: SaleCreateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    validate_payment_method(payload.payment_method)
+    ensure_tenant_access_is_active(payload.tenant_id)
+
+    if not payload.items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A venda precisa ter pelo menos um item.",
+        )
+
+    try:
+        supabase = get_supabase_admin()
+
+        product_ids = [item.product_id for item in payload.items]
+
+        products_response = (
+            supabase
+            .table("products")
+            .select("id, tenant_id, name, sale_price, current_stock, active")
+            .in_("id", product_ids)
+            .eq("tenant_id", payload.tenant_id)
+            .execute()
+        )
+
+        products = products_response.data or []
+        products_by_id = {product["id"]: product for product in products}
+
+        if len(products_by_id) != len(set(product_ids)):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Um ou mais produtos não foram encontrados.",
+            )
+
+        subtotal = Decimal("0")
+        sale_items_to_insert = []
+        stock_updates = []
+
+        for item in payload.items:
+            product = products_by_id[item.product_id]
+
+            if not product.get("active"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Produto inativo: {product['name']}",
+                )
+
+            current_stock = Decimal(str(product["current_stock"]))
+            quantity = item.quantity
+
+            if quantity > current_stock:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Estoque insuficiente para o produto {product['name']}.",
+                )
+
+            unit_price = Decimal(str(product["sale_price"]))
+            item_total = unit_price * quantity
+            subtotal += item_total
+
+            new_stock = current_stock - quantity
+
+            sale_items_to_insert.append({
+                "tenant_id": payload.tenant_id,
+                "product_id": product["id"],
+                "quantity": str(quantity),
+                "unit_price": str(unit_price),
+                "total": str(item_total),
+            })
+
+            stock_updates.append({
+                "product_id": product["id"],
+                "previous_stock": str(current_stock),
+                "new_stock": str(new_stock),
+                "quantity": str(quantity),
+            })
+
+        discount = payload.discount
+
+        if discount > subtotal:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Desconto não pode ser maior que o subtotal.",
+            )
+
+        total = subtotal - discount
+
+        sale_response = (
+            supabase
+            .table("sales")
+            .insert({
+                "tenant_id": payload.tenant_id,
+                "customer_name": payload.customer_name,
+                "payment_method": payload.payment_method,
+                "subtotal": str(subtotal),
+                "discount": str(discount),
+                "total": str(total),
+                "status": "completed",
+                "notes": payload.notes,
+                "created_by": current_user.get("id"),
+            })
+            .execute()
+        )
+
+        if not sale_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Não foi possível criar venda.",
+            )
+
+        sale = sale_response.data[0]
+
+        sale_items_with_sale_id = [
+            {
+                **item,
+                "sale_id": sale["id"],
+            }
+            for item in sale_items_to_insert
+        ]
+
+        items_response = (
+            supabase
+            .table("sale_items")
+            .insert(sale_items_with_sale_id)
+            .execute()
+        )
+
+        for stock_update in stock_updates:
+            supabase.table("products").update({
+                "current_stock": stock_update["new_stock"],
+            }).eq("id", stock_update["product_id"]).eq(
+                "tenant_id", payload.tenant_id
+            ).execute()
+
+            supabase.table("stock_movements").insert({
+                "tenant_id": payload.tenant_id,
+                "product_id": stock_update["product_id"],
+                "type": "out",
+                "quantity": stock_update["quantity"],
+                "previous_stock": stock_update["previous_stock"],
+                "new_stock": stock_update["new_stock"],
+                "reason": f"Venda #{sale['id']}",
+                "created_by": current_user.get("id"),
+            }).execute()
+
+        return {
+            **sale,
+            "items": items_response.data or [],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        )
