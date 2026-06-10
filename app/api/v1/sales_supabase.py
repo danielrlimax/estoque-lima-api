@@ -61,6 +61,77 @@ def list_sales(
         )
 
 
+def create_sale_row(
+    *,
+    tenant_id: str,
+    customer_name: str | None,
+    payment_method: str,
+    subtotal: Decimal,
+    discount: Decimal,
+    total: Decimal,
+    notes: str | None,
+    created_by: str | None,
+) -> dict:
+    supabase = get_supabase_admin()
+
+    base_payload = {
+        "tenant_id": tenant_id,
+        "customer_name": customer_name,
+        "payment_method": payment_method,
+        "subtotal": str(subtotal),
+        "discount": str(discount),
+        "total": str(total),
+        "notes": notes,
+        "created_by": created_by,
+    }
+
+    # Status principal da nossa regra de negócio.
+    # Se o enum do banco ainda não tiver "completed", rode:
+    # alter type public.sale_status add value if not exists 'completed';
+    try:
+        response = (
+            supabase
+            .table("sales")
+            .insert({
+                **base_payload,
+                "status": "completed",
+            })
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        error_text = str(error)
+
+        if "sale_status" not in error_text and "status" not in error_text:
+            raise
+
+    # Fallback para bancos com default em sales.status.
+    try:
+        response = (
+            supabase
+            .table("sales")
+            .insert(base_payload)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Não foi possível criar venda.",
+    )
+
+
 @router.post("")
 def create_sale(
     payload: SaleCreateRequest,
@@ -161,30 +232,23 @@ def create_sale(
 
         total = subtotal - discount
 
-        sale_response = (
-            supabase
-            .table("sales")
-            .insert({
-                "tenant_id": payload.tenant_id,
-                "customer_name": payload.customer_name,
-                "payment_method": payload.payment_method,
-                "subtotal": str(subtotal),
-                "discount": str(discount),
-                "total": str(total),
-                "status": "completed",
-                "notes": payload.notes,
-                "created_by": current_user.get("id"),
-            })
-            .execute()
+        customer_name = (
+            payload.customer_name.strip()
+            if payload.customer_name and payload.customer_name.strip()
+            else None
         )
 
-        if not sale_response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Não foi possível criar venda.",
-            )
+        sale = create_sale_row(
+            tenant_id=payload.tenant_id,
+            customer_name=customer_name,
+            payment_method=payload.payment_method,
+            subtotal=subtotal,
+            discount=discount,
+            total=total,
+            notes=payload.notes,
+            created_by=current_user.get("id"),
+        )
 
-        sale = sale_response.data[0]
         sale_id = sale["id"]
 
         items_with_sale_id = [
